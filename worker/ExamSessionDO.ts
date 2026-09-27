@@ -9,6 +9,11 @@
  *   3. Call Workers AI (Llama 3.3-70B) to assess risk and produce an explanation.
  *   4. Persist state to Durable Object Storage so it survives evictions.
  *   5. Broadcast the AI response back over the WebSocket.
+ *
+ * IMPORTANT WebSocket note:
+ *   We use server.accept() (non-hibernatable mode) + addEventListener.
+ *   Do NOT mix state.acceptWebSocket() with addEventListener — that causes
+ *   messages to be silently dropped.
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -43,6 +48,16 @@ function scoreSeverity(score: number): Violation['severity'] {
   if (score >= 60) return 'high';
   if (score >= 35) return 'medium';
   return 'low';
+}
+
+/** Race a promise against a timeout — throws if timeout wins */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 // ─── Durable Object Class ───────────────────────────────────────────────────
@@ -94,13 +109,28 @@ export class ExamSessionDO implements DurableObject {
     if (request.headers.get('Upgrade') === 'websocket') {
       const { 0: client, 1: server } = new WebSocketPair();
 
-      // Accept the server side of the WebSocket inside the Durable Object
-      this.state.acceptWebSocket(server);
+      // FIX: Use server.accept() (non-hibernatable mode) so that addEventListener works.
+      // DO NOT call state.acceptWebSocket() here — that API requires implementing
+      // webSocketMessage() / webSocketClose() as class methods instead of listeners,
+      // and mixing the two causes messages to be silently dropped.
+      server.accept();
       this.sockets.add(server);
 
-      server.addEventListener('message', (evt) => this.handleMessage(server, evt));
-      server.addEventListener('close', () => this.sockets.delete(server));
-      server.addEventListener('error', () => this.sockets.delete(server));
+      server.addEventListener('message', (evt) => {
+        this.handleMessage(server, evt).catch((err) => {
+          console.error('[ExamSessionDO] handleMessage error:', err);
+          this.send(server, { type: 'error', message: String(err) });
+        });
+      });
+
+      server.addEventListener('close', () => {
+        this.sockets.delete(server);
+      });
+
+      server.addEventListener('error', (err) => {
+        console.error('[ExamSessionDO] WebSocket error:', err);
+        this.sockets.delete(server);
+      });
 
       // Send current state snapshot to the newly connected client
       this.send(server, {
@@ -132,9 +162,7 @@ export class ExamSessionDO implements DurableObject {
     const rawNewScore = Math.min(100, Math.max(0, this.session.riskScore + delta));
 
     // 2. ── Call Workers AI (Llama 3.3-70B) for risk analysis ──────────────
-    //    The AI receives recent history + the new event and returns:
-    //      • A refined risk score (0-100)
-    //      • A short natural-language explanation / warning
+    //    Wrapped in a 20s timeout so the fallback fires if the model is slow.
     const aiResult = await this.callWorkersAI(eventType, rawNewScore);
 
     // 3. Update session state
@@ -179,8 +207,9 @@ export class ExamSessionDO implements DurableObject {
 
   // ─── Workers AI call ──────────────────────────────────────────────────────
   /**
-   * Calls @cf/meta/llama-3.3-70b-instruct-fp8-fast with a structured prompt.
-   * Returns { score: number, explanation: string, confidence: number }.
+   * Calls @cf/meta/llama-3.3-70b-instruct-fp8-fast via the AI binding.
+   * Wrapped in a 20-second timeout — if AI is slow/unavailable, the catch
+   * block returns a deterministic fallback so the WebSocket always responds.
    */
   private async callWorkersAI(
     eventType: string,
@@ -207,15 +236,20 @@ Only respond with the JSON object.`;
 
     try {
       // Workers AI binding — "AI" is declared in wrangler.jsonc
-      const response = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        max_tokens: 150,
-      });
+      // withTimeout ensures we never hang longer than 20 seconds
+      const response = await withTimeout(
+        this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          max_tokens: 150,
+        }),
+        20_000
+      );
 
       const text = (response as { response: string }).response?.trim() ?? '';
+      // Strip markdown code fences the model might add despite instructions
       const jsonStr = text.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(jsonStr) as { score: number; explanation: string; confidence: number };
 
@@ -225,7 +259,8 @@ Only respond with the JSON object.`;
         confidence: Math.min(1, Math.max(0, parsed.confidence ?? 0.8)),
       };
     } catch (err) {
-      console.error('[ExamSessionDO] Workers AI error:', err);
+      // Fallback: use the naive delta score so the UI always gets a response
+      console.error('[ExamSessionDO] Workers AI error (using fallback):', err);
       return {
         score: rawScore,
         explanation: this.fallbackExplanation(eventType),
@@ -245,8 +280,10 @@ Only respond with the JSON object.`;
   }
 
   // ─── WebSocket helpers ────────────────────────────────────────────────────
+
   private send(socket: WebSocket, data: unknown) {
-    if (socket.readyState === WebSocket.READY_STATE_OPEN) {
+    // readyState 1 === OPEN (WebSocket.READY_STATE_OPEN doesn't exist in Workers runtime)
+    if (socket.readyState === 1) {
       socket.send(JSON.stringify(data));
     }
   }
