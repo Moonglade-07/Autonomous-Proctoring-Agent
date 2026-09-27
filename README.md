@@ -181,7 +181,3 @@ Custom React hook managing the WebSocket lifecycle. Features:
 - Exam management (create/schedule exams, enroll students)
 
 ---
-
-## License
-
-MIT
