@@ -5,13 +5,13 @@
  * to the Cloudflare Durable Object at /api/exam/:sessionId.
  *
  * Returns:
- *   • sendEvent(type) — sends a behavioral event to the DO
- *   • status          — 'connecting' | 'open' | 'closed' | 'error'
+ *   • sendEvent(type, payload?) — sends a behavioral event to the DO
+ *   • status                    — 'connecting' | 'open' | 'closed' | 'error'
  * ─────────────────────────────────────────────────────────────────
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { BehavioralEventType, WSOutboundMsg } from '../types';
+import type { BehavioralEventType, ClipboardPayload, WSOutboundMsg } from '../types';
 
 type WSStatus = 'connecting' | 'open' | 'closed' | 'error';
 
@@ -76,14 +76,22 @@ export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
     };
   }, [connect]);
 
-  /** Send a behavioral event to the Durable Object */
-  const sendEvent = useCallback((eventType: BehavioralEventType) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ eventType }));
-    } else {
-      console.warn('[useWebSocket] Cannot send — WebSocket not open');
-    }
-  }, []);
+  /**
+   * Send a behavioral event to the Durable Object.
+   * Optionally includes a payload (e.g., clipboard action details).
+   */
+  const sendEvent = useCallback(
+    (eventType: BehavioralEventType, payload?: ClipboardPayload) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        const msg: { eventType: BehavioralEventType; payload?: ClipboardPayload } = { eventType };
+        if (payload) msg.payload = payload;
+        wsRef.current.send(JSON.stringify(msg));
+      } else {
+        console.warn('[useWebSocket] Cannot send — WebSocket not open');
+      }
+    },
+    []
+  );
 
   return { sendEvent, status };
 }

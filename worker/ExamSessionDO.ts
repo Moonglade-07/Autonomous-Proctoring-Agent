@@ -52,18 +52,24 @@ function uid(): string {
  * These values provide instant feedback while the AI call is in-flight.
  */
 const RISK_DELTAS: Record<string, number> = {
-  tab_switch:         15,
-  face_not_detected:  20,
-  multiple_faces:     25,
-  normal:             -5,
+  tab_switch:           15,
+  face_not_detected:    20,
+  multiple_faces:       25,
+  normal:               -5,
+  clipboard_activity:   18,
+  fullscreen_exit:      15,
+  right_click_attempt:  8,
 };
 
 /** Maps each event type to the corresponding Violation category. */
 const VIOLATION_TYPE_MAP: Record<string, Violation['type']> = {
-  tab_switch:        'behavioral',
-  face_not_detected: 'vision',
-  multiple_faces:    'vision',
-  normal:            'system',
+  tab_switch:          'behavioral',
+  face_not_detected:   'vision',
+  multiple_faces:      'vision',
+  normal:              'system',
+  clipboard_activity:  'behavioral',
+  fullscreen_exit:     'behavioral',
+  right_click_attempt: 'behavioral',
 };
 
 /**
@@ -238,14 +244,18 @@ export class ExamSessionDO implements DurableObject {
       return;
     }
 
-    const { eventType } = msg;
+    const { eventType, payload } = msg;
 
     // Step 1: Naive risk delta (applied before AI so state always progresses)
     const delta = RISK_DELTAS[eventType] ?? 0;
     const rawNewScore = Math.min(100, Math.max(0, this.session.riskScore + delta));
 
     // Step 2: AI-powered risk assessment via Llama 3.3-70B
-    const aiResult = await this.callWorkersAI(eventType, rawNewScore);
+    // Include payload context (e.g., clipboard action) in the AI prompt
+    const payloadContext = payload
+      ? ` (details: ${JSON.stringify(payload)})`
+      : '';
+    const aiResult = await this.callWorkersAI(eventType + payloadContext, rawNewScore);
 
     // Step 3: Build the risk event record
     const now = new Date().toISOString();
@@ -378,12 +388,17 @@ Only respond with the JSON object.`;
    */
   private fallbackExplanation(eventType: string): string {
     const map: Record<string, string> = {
-      tab_switch:        'Tab switch detected — this may indicate accessing external resources.',
-      face_not_detected: 'Face not detected in camera — please ensure you remain visible.',
-      multiple_faces:    'Multiple faces detected — only the exam taker should be present.',
-      normal:            'Behavior appears normal. No violations detected.',
+      tab_switch:          'Tab switch detected — this may indicate accessing external resources.',
+      face_not_detected:   'Face not detected in camera — please ensure you remain visible.',
+      multiple_faces:      'Multiple faces detected — only the exam taker should be present.',
+      normal:              'Behavior appears normal. No violations detected.',
+      clipboard_activity:  'Clipboard activity detected — copy/paste operations are monitored during exams.',
+      fullscreen_exit:     'Fullscreen mode exited — exam requires fullscreen mode to be active.',
+      right_click_attempt: 'Right-click attempt detected — context menu access is restricted during exams.',
     };
-    return map[eventType] ?? 'Behavioral event recorded and flagged for review.';
+    // Strip payload context suffix (e.g. " (details: ...)") if present
+    const baseType = eventType.split(' (')[0];
+    return map[baseType] ?? 'Behavioral event recorded and flagged for review.';
   }
 
   // ─── WebSocket helpers ────────────────────────────────────────────────────

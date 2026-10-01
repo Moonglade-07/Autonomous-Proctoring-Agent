@@ -35,6 +35,9 @@ function triggerIcon(trigger: string): string {
     face_not_detected: '👤',
     multiple_faces: '👥',
     normal: '✅',
+    clipboard_activity: '📋',
+    fullscreen_exit: '🖥️',
+    right_click_attempt: '🚫',
   };
   return icons[trigger] ?? '⚠️';
 }
@@ -46,6 +49,9 @@ function triggerLabel(trigger: string): string {
     face_not_detected: 'Face Not Detected',
     multiple_faces: 'Multiple Faces',
     normal: 'Normal Behavior',
+    clipboard_activity: 'Clipboard Activity',
+    fullscreen_exit: 'Fullscreen Exit',
+    right_click_attempt: 'Right-Click Attempt',
   };
   return labels[trigger] ?? trigger;
 }

@@ -1,18 +1,19 @@
 /**
  * ExamPage.tsx
  * ─────────────────────────────────────────────────────────────────
- * Main exam interface — Phase 1 of the Autonomous Proctoring Agent.
+ * Main exam interface — Phase 2a of the Autonomous Proctoring Agent.
  *
- * This page demonstrates real-time AI-powered exam proctoring using:
- *   • Cloudflare Workers AI (Llama 3.3-70B) for risk reasoning
- *   • Durable Objects for per-session state persistence
- *   • WebSockets for real-time bidirectional communication
- *   • React frontend served from Cloudflare Workers Static Assets
+ * Changes from Phase 1:
+ *   • Removed simulation buttons entirely
+ *   • Real browser-native behavioral detection replaces manual triggers
+ *   • "Start Exam" button initiates monitoring + requests fullscreen
+ *   • "Monitoring Active" status panel shows real-time signal states
  *
- * WebSocket flow:
- *   1. On mount, useWebSocket connects to ws://<host>/api/exam/<sessionId>
- *   2. Durable Object sends a session_snapshot immediately on connect
- *   3. Button click → sendEvent() → JSON over WebSocket → Durable Object
+ * Detection pipeline (Phase 2a):
+ *   1. User clicks "Start Exam" → fullscreen requested + listeners attached
+ *   2. Browser events (tab switch, copy/paste, fullscreen exit, right-click)
+ *      are automatically detected by useBehavioralDetection
+ *   3. Events are debounced (1s) and sent over WebSocket to the Durable Object
  *   4. DO calls Workers AI (Llama 3.3-70B) → sends risk_update back
  *   5. onMessage() updates local React state → UI re-renders
  * ─────────────────────────────────────────────────────────────────
@@ -23,53 +24,14 @@ import { WebcamPreview } from '../components/WebcamPreview';
 import { RiskIndicator } from '../components/RiskIndicator';
 import { EventLog } from '../components/EventLog';
 import { useWebSocket } from '../hooks/useWebSocket';
-import type { RiskEvent, Violation, WSOutboundMsg, BehavioralEventType } from '../types';
+import { useBehavioralDetection } from '../hooks/useBehavioralDetection';
+import type { RiskEvent, Violation, WSOutboundMsg } from '../types';
 
 // ─── Session ID ──────────────────────────────────────────────────────────────
-// Stable per browser tab — each new tab creates an independent proctoring session.
 const SESSION_ID = `session-${Math.random().toString(36).slice(2, 10)}`;
 
-// ─── Simulation button configuration ────────────────────────────────────────
-interface SimButton {
-  label: string;
-  event: BehavioralEventType;
-  icon: string;
-  colorClass: string;
-  description: string;
-}
+// ─── WebSocket status indicators ─────────────────────────────────────────────
 
-const SIM_BUTTONS: SimButton[] = [
-  {
-    label: 'Tab Switch',
-    event: 'tab_switch',
-    icon: '🔀',
-    colorClass: 'bg-orange-500/15 hover:bg-orange-500/25 text-orange-300 ring-1 ring-orange-500/40 hover:ring-orange-400',
-    description: 'Simulates the student switching to another browser tab',
-  },
-  {
-    label: 'Face Not Detected',
-    event: 'face_not_detected',
-    icon: '👤',
-    colorClass: 'bg-red-500/15 hover:bg-red-500/25 text-red-300 ring-1 ring-red-500/40 hover:ring-red-400',
-    description: 'Simulates the student moving out of the camera frame',
-  },
-  {
-    label: 'Multiple Faces',
-    event: 'multiple_faces',
-    icon: '👥',
-    colorClass: 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 ring-1 ring-rose-500/40 hover:ring-rose-400',
-    description: 'Simulates another person appearing in the camera view',
-  },
-  {
-    label: 'Normal Behavior',
-    event: 'normal',
-    icon: '✅',
-    colorClass: 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 ring-1 ring-emerald-500/40 hover:ring-emerald-400',
-    description: 'Simulates compliant exam behavior (reduces risk score)',
-  },
-];
-
-// ─── WebSocket status indicator ──────────────────────────────────────────────
 function WSStatusBanner({ status }: { status: string }) {
   if (status === 'open') return null;
 
@@ -128,58 +90,83 @@ function WSStatusDot({ status }: { status: string }) {
   );
 }
 
+// ─── Monitoring status indicator row ─────────────────────────────────────────
+
+interface SignalRowProps {
+  label: string;
+  icon: string;
+  value: string;
+  status: 'ok' | 'warn' | 'off';
+}
+
+function SignalRow({ label, icon, value, status }: SignalRowProps) {
+  const colors = {
+    ok:   'text-emerald-400',
+    warn: 'text-amber-400',
+    off:  'text-gray-600',
+  };
+  const dotColors = {
+    ok:   'bg-emerald-500',
+    warn: 'bg-amber-500 animate-pulse',
+    off:  'bg-gray-700',
+  };
+  return (
+    <div className="flex items-center gap-2.5 py-1.5">
+      <span className="text-base flex-shrink-0 select-none" aria-hidden>{icon}</span>
+      <span className="text-xs text-gray-400 min-w-[5.5rem]">{label}</span>
+      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotColors[status]}`} />
+      <span className={`text-xs font-medium ${colors[status]}`}>{value}</span>
+    </div>
+  );
+}
+
 // ─── Main page component ─────────────────────────────────────────────────────
+
 export function ExamPage() {
   const [riskScore, setRiskScore] = useState(0);
   const [riskHistory, setRiskHistory] = useState<RiskEvent[]>([]);
-  const [visibleLog, setVisibleLog] = useState<RiskEvent[]>([]); // local view (clearable)
+  const [visibleLog, setVisibleLog] = useState<RiskEvent[]>([]);
   const [violations, setViolations] = useState<Violation[]>([]);
   const [lastActivity, setLastActivity] = useState<string>('—');
-  const [pendingEvent, setPendingEvent] = useState<string | null>(null);
   const [serverErrorMsg, setServerErrorMsg] = useState<string | null>(null);
 
-  // ── Handle incoming WebSocket messages from the Durable Object ────────────
+  // ── WebSocket ──────────────────────────────────────────────────────────────
   const handleMessage = useCallback((msg: WSOutboundMsg) => {
     if (msg.type === 'session_snapshot') {
-      // Initial state hydration sent by the DO immediately on WebSocket connect
       setRiskScore(msg.session.riskScore);
       setRiskHistory(msg.session.riskHistory);
       setVisibleLog(msg.session.riskHistory);
       setViolations(msg.session.violations);
-
     } else if (msg.type === 'risk_update') {
-      // Real-time update after the DO has called Workers AI and persisted state
       setRiskScore(msg.riskScore);
       setRiskHistory((prev) => [...prev, msg.riskEvent]);
       setVisibleLog((prev) => [...prev, msg.riskEvent]);
       setViolations(msg.violations);
       setLastActivity(msg.riskEvent.triggers[0] ?? 'unknown');
-      setPendingEvent(null);
       setServerErrorMsg(null);
-
     } else if (msg.type === 'error') {
-      // Workers AI or server-side error — surface it in the UI
       console.error('[ExamPage] Server error:', msg.message);
       setServerErrorMsg(msg.message);
-      setPendingEvent(null);
     }
   }, []);
 
   const { sendEvent, status } = useWebSocket({ sessionId: SESSION_ID, onMessage: handleMessage });
 
-  // ── Send a behavioral event over WebSocket ────────────────────────────────
-  const handleSimulate = (eventType: BehavioralEventType) => {
-    setPendingEvent(eventType);
-    setServerErrorMsg(null);
-    sendEvent(eventType);
-  };
+  // ── Behavioral detection ───────────────────────────────────────────────────
+  const { monitoringState, startMonitoring, reenterFullscreen } =
+    useBehavioralDetection({ sendEvent, wsStatus: status });
 
-  // ── Clear event log view (does not reset backend session) ─────────────────
+  // ── Clear event log ────────────────────────────────────────────────────────
   const handleClearLog = () => setVisibleLog([]);
 
-  // ── Derived stats ─────────────────────────────────────────────────────────
+  // ── Derived stats ──────────────────────────────────────────────────────────
   const criticalCount = violations.filter((v) => v.severity === 'critical').length;
   const highCount     = violations.filter((v) => v.severity === 'high').length;
+
+  // ── Format last clipboard time ─────────────────────────────────────────────
+  const clipboardText = monitoringState.lastClipboard
+    ? `${monitoringState.lastClipboard.action} at ${new Date(monitoringState.lastClipboard.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+    : 'None';
 
   return (
     <div className="min-h-screen bg-gray-950 text-white font-sans">
@@ -187,7 +174,6 @@ export function ExamPage() {
       {/* ── Sticky header ───────────────────────────────────────────────────── */}
       <header className="border-b border-white/[0.08] bg-gray-900/90 backdrop-blur-md sticky top-0 z-20">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
-          {/* Branding */}
           <div className="flex items-center gap-3 min-w-0">
             <div className="flex-shrink-0 w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-white font-bold text-sm shadow-lg shadow-violet-900/30">
               AP
@@ -200,8 +186,12 @@ export function ExamPage() {
             </div>
           </div>
 
-          {/* Right side: violation badges + WS status */}
           <div className="flex items-center gap-3 flex-shrink-0">
+            {monitoringState.active && (
+              <span className="text-xs bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/40 px-2 py-0.5 rounded-full font-semibold animate-pulse">
+                Monitoring
+              </span>
+            )}
             {criticalCount > 0 && (
               <span className="text-xs bg-red-500/15 text-red-400 ring-1 ring-red-500/40 px-2 py-0.5 rounded-full font-semibold">
                 {criticalCount} Critical
@@ -217,10 +207,10 @@ export function ExamPage() {
         </div>
       </header>
 
-      {/* ── Reconnect / error banner (shown when WS is not open) ────────────── */}
+      {/* ── Reconnect banner ────────────────────────────────────────────────── */}
       <WSStatusBanner status={status} />
 
-      {/* ── Server-side error banner ─────────────────────────────────────────── */}
+      {/* ── Server error banner ─────────────────────────────────────────────── */}
       {serverErrorMsg && (
         <div className="mx-4 sm:mx-6 mt-3 rounded-xl border border-red-700/30 bg-red-950/40 px-4 py-2.5 flex items-start gap-2">
           <span className="text-base flex-shrink-0">⚠️</span>
@@ -238,66 +228,125 @@ export function ExamPage() {
         </div>
       )}
 
-      {/* ── Hero description banner ──────────────────────────────────────────── */}
+      {/* ── Fullscreen exit banner ──────────────────────────────────────────── */}
+      {monitoringState.active && !monitoringState.isFullscreen && (
+        <div className="mx-4 sm:mx-6 mt-3 rounded-xl border border-amber-700/40 bg-amber-950/50 px-4 py-3 flex items-center gap-3">
+          <span className="text-xl flex-shrink-0">⚠️</span>
+          <div className="flex-1">
+            <p className="text-sm font-semibold text-amber-300">Fullscreen Required</p>
+            <p className="text-xs text-amber-600 mt-0.5">
+              You exited fullscreen mode. This has been recorded. Please re-enter to continue the exam.
+            </p>
+          </div>
+          <button
+            id="reenter-fullscreen-btn"
+            onClick={reenterFullscreen}
+            className="flex-shrink-0 px-4 py-2 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold rounded-lg ring-1 ring-amber-500/40 transition-colors cursor-pointer"
+          >
+            Re-enter Fullscreen
+          </button>
+        </div>
+      )}
+
+      {/* ── Hero banner ─────────────────────────────────────────────────────── */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-1">
         <div className="rounded-2xl bg-gradient-to-r from-violet-950/60 via-indigo-950/50 to-blue-950/40 border border-violet-700/20 px-5 py-4">
           <p className="text-sm text-gray-300 leading-relaxed">
-            <span className="font-semibold text-white">Phase 1 Demo — </span>
-            This interface demonstrates real-time AI-powered exam proctoring.
-            Click a simulation button to send a behavioral event over{' '}
+            <span className="font-semibold text-white">Phase 2a — Real Detection — </span>
+            Behavioral events are now detected automatically from real browser actions.
+            Tab switches, clipboard usage, fullscreen exits, and right-click attempts are
+            monitored and sent over{' '}
             <span className="text-violet-400 font-medium">WebSocket</span> to a{' '}
             <span className="text-indigo-400 font-medium">Cloudflare Durable Object</span>,
-            which calls{' '}
+            where{' '}
             <span className="text-blue-400 font-medium">Workers AI (Llama 3.3-70B)</span>{' '}
-            to reason about risk, persist session memory, and stream the result back in real time.
+            reasons about risk in real time.
           </p>
         </div>
       </div>
 
-      {/* ── Main 3-column grid ───────────────────────────────────────────────── */}
+      {/* ── Main grid ───────────────────────────────────────────────────────── */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-5 grid grid-cols-1 lg:grid-cols-3 gap-5">
 
-        {/* ── Left column: Webcam + Controls + Stats ───────────────────────── */}
+        {/* ── Left column: Webcam + Monitoring + Stats ──────────────────────── */}
         <div className="lg:col-span-1 flex flex-col gap-4">
 
           {/* Webcam */}
           <WebcamPreview />
 
-          {/* Simulation controls */}
+          {/* Start Exam / Monitoring panel */}
           <div className="rounded-2xl bg-gray-900/60 border border-white/[0.07] p-4">
-            <h2 className="text-xs font-bold tracking-[0.18em] text-gray-500 uppercase mb-3">
-              Simulate Behavioral Event
-            </h2>
-            <div className="grid grid-cols-1 gap-2">
-              {SIM_BUTTONS.map((btn) => (
+            {!monitoringState.active ? (
+              /* ── Pre-exam: Start button ──────────────────────────────── */
+              <div className="flex flex-col items-center py-4 gap-4">
+                <div className="text-center">
+                  <h2 className="text-sm font-bold text-gray-200 mb-1">Ready to Begin?</h2>
+                  <p className="text-xs text-gray-500 leading-relaxed max-w-[220px]">
+                    Clicking below will enter fullscreen mode and begin monitoring for behavioral violations.
+                  </p>
+                </div>
                 <button
-                  key={btn.event}
-                  id={`sim-btn-${btn.event}`}
-                  onClick={() => handleSimulate(btn.event)}
-                  disabled={status !== 'open' || pendingEvent !== null}
-                  title={btn.description}
-                  className={`
-                    flex items-center gap-2.5 px-4 py-2.5 rounded-xl text-sm font-medium
-                    transition-all duration-200 cursor-pointer select-none text-left
+                  id="start-exam-btn"
+                  onClick={startMonitoring}
+                  disabled={status !== 'open'}
+                  className="
+                    w-full px-6 py-3 rounded-xl text-sm font-bold cursor-pointer select-none
+                    bg-gradient-to-r from-violet-600 to-indigo-600
+                    hover:from-violet-500 hover:to-indigo-500
+                    text-white shadow-lg shadow-violet-900/40
+                    transition-all duration-200
                     disabled:opacity-40 disabled:cursor-not-allowed
-                    ${btn.colorClass}
-                  `}
+                    active:scale-[0.98]
+                  "
                 >
-                  <span className="text-base leading-none flex-shrink-0">{btn.icon}</span>
-                  <span className="flex-1">{btn.label}</span>
-                  {pendingEvent === btn.event && (
-                    <svg className="w-3.5 h-3.5 animate-spin opacity-70 flex-shrink-0" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                    </svg>
-                  )}
+                  🛡️ Start Exam
                 </button>
-              ))}
-            </div>
-            {pendingEvent && (
-              <p className="text-xs text-gray-600 mt-3 text-center">
-                Waiting for AI analysis…
-              </p>
+                {status !== 'open' && (
+                  <p className="text-xs text-yellow-600 animate-pulse">
+                    Waiting for connection…
+                  </p>
+                )}
+              </div>
+            ) : (
+              /* ── Active monitoring: signal indicators ────────────── */
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-60" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                  </span>
+                  <h2 className="text-xs font-bold tracking-[0.18em] text-emerald-400 uppercase">
+                    Monitoring Active
+                  </h2>
+                </div>
+
+                <div className="space-y-0.5">
+                  <SignalRow
+                    label="Tab Focus"
+                    icon="🔀"
+                    value={monitoringState.tabFocused ? 'Focused' : 'Switched Away'}
+                    status={monitoringState.tabFocused ? 'ok' : 'warn'}
+                  />
+                  <SignalRow
+                    label="Fullscreen"
+                    icon="🖥️"
+                    value={monitoringState.isFullscreen ? 'Active' : 'Exited'}
+                    status={monitoringState.isFullscreen ? 'ok' : 'warn'}
+                  />
+                  <SignalRow
+                    label="Clipboard"
+                    icon="📋"
+                    value={clipboardText}
+                    status={monitoringState.lastClipboard ? 'warn' : 'ok'}
+                  />
+                  <SignalRow
+                    label="Right-clicks"
+                    icon="🚫"
+                    value={monitoringState.rightClickCount > 0 ? `${monitoringState.rightClickCount} blocked` : 'None'}
+                    status={monitoringState.rightClickCount > 0 ? 'warn' : 'ok'}
+                  />
+                </div>
+              </div>
             )}
           </div>
 
@@ -333,8 +382,8 @@ export function ExamPage() {
                 </h3>
                 <p className="text-xs text-gray-500 leading-relaxed mb-4">
                   Computed by <span className="text-violet-400">Llama 3.3-70B</span> on Cloudflare Workers AI.
-                  Each event is analyzed against the full session history to produce a contextual
-                  risk score and natural-language explanation.
+                  Real behavioral signals are analyzed against the full session history to produce
+                  contextual risk scores and natural-language explanations.
                 </p>
 
                 {/* Recent violations */}
@@ -383,7 +432,7 @@ export function ExamPage() {
       {/* ── Footer ──────────────────────────────────────────────────────────── */}
       <footer className="border-t border-white/[0.07] mt-4 py-4 px-4 sm:px-6">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-gray-700">
-          <span>Autonomous Proctoring Agent · Phase 1</span>
+          <span>Autonomous Proctoring Agent · Phase 2a</span>
           <span>Powered by Cloudflare Workers AI · Durable Objects · WebSockets</span>
         </div>
       </footer>
