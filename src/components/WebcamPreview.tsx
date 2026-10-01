@@ -2,23 +2,35 @@
  * WebcamPreview.tsx
  * ─────────────────────────────────────────────────────────────────
  * Requests real browser webcam access via getUserMedia.
- * Falls back to a styled placeholder if:
- *   • The user denies camera permission
- *   • The browser doesn't support getUserMedia
+ * Falls back to a styled placeholder if the user denies or browser
+ * doesn't support camera access.
+ *
+ * Phase 2b: Accepts an optional `videoRef` prop so the face detection
+ * hook can read frames from the same video element without creating
+ * a second camera stream.
  *
  * Overlays:
  *   • REC indicator (always visible)
  *   • Camera label corner badge
+ *   • Face detection status overlay (bottom-right, optional)
  *   • Scan-line aesthetic overlay
  * ─────────────────────────────────────────────────────────────────
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 
 type CameraState = 'requesting' | 'active' | 'denied' | 'unsupported';
 
-export function WebcamPreview() {
-  const videoRef = useRef<HTMLVideoElement>(null);
+interface WebcamPreviewProps {
+  /** External ref to the <video> element — used by useFaceDetection to read frames */
+  videoRef?: RefObject<HTMLVideoElement | null>;
+  /** Optional face detection overlay content */
+  faceOverlay?: React.ReactNode;
+}
+
+export function WebcamPreview({ videoRef: externalVideoRef, faceOverlay }: WebcamPreviewProps) {
+  const internalVideoRef = useRef<HTMLVideoElement>(null);
+  const videoElement = externalVideoRef ?? internalVideoRef;
   const streamRef = useRef<MediaStream | null>(null);
   const [cameraState, setCameraState] = useState<CameraState>('requesting');
 
@@ -38,14 +50,13 @@ export function WebcamPreview() {
         });
 
         if (cancelled) {
-          // Component unmounted while awaiting — stop the stream immediately
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
 
         streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
+        if (videoElement.current) {
+          videoElement.current.srcObject = stream;
         }
         setCameraState('active');
       } catch (err) {
@@ -60,18 +71,17 @@ export function WebcamPreview() {
 
     return () => {
       cancelled = true;
-      // Stop all camera tracks on unmount to release the hardware
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     };
-  }, []);
+  }, [videoElement]);
 
   return (
     <div className="relative w-full aspect-video rounded-2xl overflow-hidden bg-gray-900 border border-gray-700 shadow-inner">
 
       {/* ── Live video feed ─────────────────────────────────────────── */}
       <video
-        ref={videoRef}
+        ref={videoElement}
         autoPlay
         playsInline
         muted
@@ -122,6 +132,13 @@ export function WebcamPreview() {
         </span>
         <span className="text-xs text-red-400 font-semibold tracking-widest uppercase drop-shadow">REC</span>
       </div>
+
+      {/* ── Face detection overlay (bottom-right, injected by parent) ── */}
+      {faceOverlay && (
+        <div className="absolute bottom-3 right-3 z-10">
+          {faceOverlay}
+        </div>
+      )}
 
       {/* ── Camera label (bottom-left) ───────────────────────────────── */}
       <div className="absolute bottom-3 left-3 z-10">

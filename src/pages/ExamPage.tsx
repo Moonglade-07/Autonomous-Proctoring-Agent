@@ -1,30 +1,28 @@
 /**
  * ExamPage.tsx
  * ─────────────────────────────────────────────────────────────────
- * Main exam interface — Phase 2a of the Autonomous Proctoring Agent.
+ * Main exam interface — Phase 2b of the Autonomous Proctoring Agent.
  *
- * Changes from Phase 1:
- *   • Removed simulation buttons entirely
- *   • Real browser-native behavioral detection replaces manual triggers
- *   • "Start Exam" button initiates monitoring + requests fullscreen
- *   • "Monitoring Active" status panel shows real-time signal states
+ * Changes from Phase 2a:
+ *   • Added real-time client-side face detection using face-api.js
+ *   • Live video feed is processed every 700ms to detect face count and orientation
+ *   • Suspicious states (no face, multiple faces, head turned) are flagged locally
+ *     and shown in the UI, but NOT yet sent to the backend.
  *
- * Detection pipeline (Phase 2a):
- *   1. User clicks "Start Exam" → fullscreen requested + listeners attached
- *   2. Browser events (tab switch, copy/paste, fullscreen exit, right-click)
- *      are automatically detected by useBehavioralDetection
- *   3. Events are debounced (1s) and sent over WebSocket to the Durable Object
- *   4. DO calls Workers AI (Llama 3.3-70B) → sends risk_update back
- *   5. onMessage() updates local React state → UI re-renders
+ * Architecture:
+ *   - The video feed from WebcamPreview is shared via a React ref.
+ *   - useFaceDetection hook runs inference on the video frames.
+ *   - useBehavioralDetection still handles tab/fullscreen/clipboard events.
  * ─────────────────────────────────────────────────────────────────
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { WebcamPreview } from '../components/WebcamPreview';
 import { RiskIndicator } from '../components/RiskIndicator';
 import { EventLog } from '../components/EventLog';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useBehavioralDetection } from '../hooks/useBehavioralDetection';
+import { useFaceDetection } from '../hooks/useFaceDetection';
 import type { RiskEvent, Violation, WSOutboundMsg } from '../types';
 
 // ─── Session ID ──────────────────────────────────────────────────────────────
@@ -95,25 +93,27 @@ function WSStatusDot({ status }: { status: string }) {
 interface SignalRowProps {
   label: string;
   icon: string;
-  value: string;
-  status: 'ok' | 'warn' | 'off';
+  value: string | React.ReactNode;
+  status: 'ok' | 'warn' | 'off' | 'error';
 }
 
 function SignalRow({ label, icon, value, status }: SignalRowProps) {
   const colors = {
-    ok:   'text-emerald-400',
-    warn: 'text-amber-400',
-    off:  'text-gray-600',
+    ok:    'text-emerald-400',
+    warn:  'text-amber-400',
+    error: 'text-red-400',
+    off:   'text-gray-600',
   };
   const dotColors = {
-    ok:   'bg-emerald-500',
-    warn: 'bg-amber-500 animate-pulse',
-    off:  'bg-gray-700',
+    ok:    'bg-emerald-500',
+    warn:  'bg-amber-500 animate-pulse',
+    error: 'bg-red-500 animate-pulse',
+    off:   'bg-gray-700',
   };
   return (
     <div className="flex items-center gap-2.5 py-1.5">
       <span className="text-base flex-shrink-0 select-none" aria-hidden>{icon}</span>
-      <span className="text-xs text-gray-400 min-w-[5.5rem]">{label}</span>
+      <span className="text-xs text-gray-400 min-w-[6.5rem]">{label}</span>
       <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotColors[status]}`} />
       <span className={`text-xs font-medium ${colors[status]}`}>{value}</span>
     </div>
@@ -129,6 +129,9 @@ export function ExamPage() {
   const [violations, setViolations] = useState<Violation[]>([]);
   const [lastActivity, setLastActivity] = useState<string>('—');
   const [serverErrorMsg, setServerErrorMsg] = useState<string | null>(null);
+
+  // Shared ref for the video element (used by WebcamPreview and useFaceDetection)
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const handleMessage = useCallback((msg: WSOutboundMsg) => {
@@ -152,9 +155,19 @@ export function ExamPage() {
 
   const { sendEvent, status } = useWebSocket({ sessionId: SESSION_ID, onMessage: handleMessage });
 
-  // ── Behavioral detection ───────────────────────────────────────────────────
-  const { monitoringState, startMonitoring, reenterFullscreen } =
+  // ── Behavioral detection (Phase 2a) ────────────────────────────────────────
+  const { monitoringState, startMonitoring: startBehavioral, reenterFullscreen } =
     useBehavioralDetection({ sendEvent, wsStatus: status });
+
+  // ── Face detection (Phase 2b) ──────────────────────────────────────────────
+  const { faceState, pendingFlags } = useFaceDetection({
+    videoRef,
+    monitoringActive: monitoringState.active,
+  });
+
+  const handleStartExam = useCallback(async () => {
+    await startBehavioral();
+  }, [startBehavioral]);
 
   // ── Clear event log ────────────────────────────────────────────────────────
   const handleClearLog = () => setVisibleLog([]);
@@ -163,10 +176,40 @@ export function ExamPage() {
   const criticalCount = violations.filter((v) => v.severity === 'critical').length;
   const highCount     = violations.filter((v) => v.severity === 'high').length;
 
-  // ── Format last clipboard time ─────────────────────────────────────────────
   const clipboardText = monitoringState.lastClipboard
     ? `${monitoringState.lastClipboard.action} at ${new Date(monitoringState.lastClipboard.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
     : 'None';
+
+  // ── Face state formatting ──────────────────────────────────────────────────
+  let faceLabel = 'Loading models…';
+  let faceStatus: 'ok' | 'warn' | 'error' | 'off' = 'off';
+
+  if (faceState.modelState === 'error') {
+    faceLabel = 'Models failed to load';
+    faceStatus = 'error';
+  } else if (faceState.modelState === 'ready' && !monitoringState.active) {
+    faceLabel = 'Ready to monitor';
+    faceStatus = 'off';
+  } else if (monitoringState.active && faceState.detecting) {
+    if (faceState.faceCount === 0) {
+      faceLabel = 'No face detected';
+      faceStatus = 'error';
+    } else if (faceState.faceCount > 1) {
+      faceLabel = `${faceState.faceCount} faces detected`;
+      faceStatus = 'error';
+    } else {
+      faceLabel = '1 face detected';
+      faceStatus = 'ok';
+    }
+  }
+
+  let orientationLabel = '—';
+  let orientationStatus: 'ok' | 'warn' | 'off' = 'off';
+
+  if (monitoringState.active && faceState.faceCount === 1) {
+    orientationLabel = faceState.orientation;
+    orientationStatus = faceState.orientation === 'forward' ? 'ok' : 'warn';
+  }
 
   return (
     <div className="min-h-screen bg-gray-950 text-white font-sans">
@@ -228,6 +271,24 @@ export function ExamPage() {
         </div>
       )}
 
+      {/* ── Pending Flags (Phase 2b Local Alerts) ─────────────────────────── */}
+      {pendingFlags.length > 0 && (
+        <div className="mx-4 sm:mx-6 mt-3 rounded-xl border border-rose-700/40 bg-rose-950/40 px-4 py-3 flex items-center gap-3">
+          <span className="text-xl flex-shrink-0 animate-pulse">🚨</span>
+          <div className="flex-1">
+            <p className="text-sm font-semibold text-rose-300">Pending Review (Local Only)</p>
+            <div className="text-xs text-rose-500 mt-0.5 space-y-1">
+              {pendingFlags.map((f, i) => (
+                <p key={i}>
+                  • {f.type.replace('_', ' ')} ({(f.durationMs / 1000).toFixed(1)}s)
+                  {f.orientation ? ` — looking ${f.orientation}` : ''}
+                </p>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Fullscreen exit banner ──────────────────────────────────────────── */}
       {monitoringState.active && !monitoringState.isFullscreen && (
         <div className="mx-4 sm:mx-6 mt-3 rounded-xl border border-amber-700/40 bg-amber-950/50 px-4 py-3 flex items-center gap-3">
@@ -248,19 +309,25 @@ export function ExamPage() {
         </div>
       )}
 
+      {/* ── Face Model Error Fallback ──────────────────────────────────────── */}
+      {faceState.modelState === 'error' && (
+        <div className="mx-4 sm:mx-6 mt-3 rounded-xl border border-gray-700/40 bg-gray-800/40 px-4 py-2 flex items-center gap-3">
+          <span className="text-base flex-shrink-0">ℹ️</span>
+          <p className="text-xs text-gray-400">
+            Face monitoring unavailable (models failed to load). Continuing with other proctoring signals.
+          </p>
+        </div>
+      )}
+
       {/* ── Hero banner ─────────────────────────────────────────────────────── */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-1">
         <div className="rounded-2xl bg-gradient-to-r from-violet-950/60 via-indigo-950/50 to-blue-950/40 border border-violet-700/20 px-5 py-4">
           <p className="text-sm text-gray-300 leading-relaxed">
-            <span className="font-semibold text-white">Phase 2a — Real Detection — </span>
-            Behavioral events are now detected automatically from real browser actions.
-            Tab switches, clipboard usage, fullscreen exits, and right-click attempts are
-            monitored and sent over{' '}
-            <span className="text-violet-400 font-medium">WebSocket</span> to a{' '}
-            <span className="text-indigo-400 font-medium">Cloudflare Durable Object</span>,
-            where{' '}
-            <span className="text-blue-400 font-medium">Workers AI (Llama 3.3-70B)</span>{' '}
-            reasons about risk in real time.
+            <span className="font-semibold text-white">Phase 2b — Local Face Detection — </span>
+            The browser now runs <span className="text-emerald-400 font-medium">face-api.js</span>{' '}
+            locally on the webcam feed to track face count and head orientation in real time.
+            Suspicious states are flagged locally for review (sending to backend AI is coming in Phase 2c).
+            Tab/clipboard/fullscreen behaviors continue to flow to the backend.
           </p>
         </div>
       </div>
@@ -272,7 +339,20 @@ export function ExamPage() {
         <div className="lg:col-span-1 flex flex-col gap-4">
 
           {/* Webcam */}
-          <WebcamPreview />
+          <WebcamPreview
+            videoRef={videoRef}
+            faceOverlay={
+              monitoringState.active && faceState.detecting && (
+                <div className="bg-black/60 backdrop-blur-sm border border-white/10 px-2 py-1 rounded-lg flex items-center gap-2">
+                  <span className="text-[10px] uppercase font-bold text-gray-400 tracking-wider">Face</span>
+                  <div className={`w-2 h-2 rounded-full ${faceStatus === 'ok' ? 'bg-emerald-500' : 'bg-rose-500 animate-pulse'}`} />
+                  <span className="text-xs font-mono font-medium text-white/90">
+                    {faceState.faceCount > 0 ? `${faceState.faceCount}` : '0'}
+                  </span>
+                </div>
+              )
+            }
+          />
 
           {/* Start Exam / Monitoring panel */}
           <div className="rounded-2xl bg-gray-900/60 border border-white/[0.07] p-4">
@@ -287,8 +367,8 @@ export function ExamPage() {
                 </div>
                 <button
                   id="start-exam-btn"
-                  onClick={startMonitoring}
-                  disabled={status !== 'open'}
+                  onClick={handleStartExam}
+                  disabled={status !== 'open' || faceState.modelState === 'loading'}
                   className="
                     w-full px-6 py-3 rounded-xl text-sm font-bold cursor-pointer select-none
                     bg-gradient-to-r from-violet-600 to-indigo-600
@@ -299,7 +379,7 @@ export function ExamPage() {
                     active:scale-[0.98]
                   "
                 >
-                  🛡️ Start Exam
+                  {faceState.modelState === 'loading' ? 'Loading AI Models…' : '🛡️ Start Exam'}
                 </button>
                 {status !== 'open' && (
                   <p className="text-xs text-yellow-600 animate-pulse">
@@ -310,7 +390,7 @@ export function ExamPage() {
             ) : (
               /* ── Active monitoring: signal indicators ────────────── */
               <div>
-                <div className="flex items-center gap-2 mb-3">
+                <div className="flex items-center gap-2 mb-3 border-b border-white/5 pb-2">
                   <span className="relative flex h-2 w-2">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-60" />
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
@@ -320,7 +400,26 @@ export function ExamPage() {
                   </h2>
                 </div>
 
+                {/* Face AI Signals */}
+                <div className="space-y-0.5 mb-2 border-b border-white/5 pb-2">
+                  <h3 className="text-[10px] font-bold tracking-wider text-gray-500 uppercase mb-1.5 px-1">Vision AI (Local)</h3>
+                  <SignalRow
+                    label="Face Detection"
+                    icon="👤"
+                    value={faceLabel}
+                    status={faceStatus}
+                  />
+                  <SignalRow
+                    label="Orientation"
+                    icon="🧭"
+                    value={<span className="capitalize">{orientationLabel}</span>}
+                    status={orientationStatus}
+                  />
+                </div>
+
+                {/* Behavioral Signals */}
                 <div className="space-y-0.5">
+                  <h3 className="text-[10px] font-bold tracking-wider text-gray-500 uppercase mb-1.5 px-1 pt-1">Behavior (Backend)</h3>
                   <SignalRow
                     label="Tab Focus"
                     icon="🔀"
@@ -432,7 +531,7 @@ export function ExamPage() {
       {/* ── Footer ──────────────────────────────────────────────────────────── */}
       <footer className="border-t border-white/[0.07] mt-4 py-4 px-4 sm:px-6">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-gray-700">
-          <span>Autonomous Proctoring Agent · Phase 2a</span>
+          <span>Autonomous Proctoring Agent · Phase 2b</span>
           <span>Powered by Cloudflare Workers AI · Durable Objects · WebSockets</span>
         </div>
       </footer>
