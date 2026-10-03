@@ -1,18 +1,13 @@
 /**
  * ExamPage.tsx
  * ─────────────────────────────────────────────────────────────────
- * Main exam interface — Phase 2b of the Autonomous Proctoring Agent.
+ * Main exam interface — Phase 2c of the Autonomous Proctoring Agent.
  *
- * Changes from Phase 2a:
- *   • Added real-time client-side face detection using face-api.js
- *   • Live video feed is processed every 700ms to detect face count and orientation
- *   • Suspicious states (no face, multiple faces, head turned) are flagged locally
- *     and shown in the UI, but NOT yet sent to the backend.
- *
- * Architecture:
- *   - The video feed from WebcamPreview is shared via a React ref.
- *   - useFaceDetection hook runs inference on the video frames.
- *   - useBehavioralDetection still handles tab/fullscreen/clipboard events.
+ * Phase 2c additions:
+ *   • Identity capture modal before exam starts
+ *   • Reference face thumbnail display in monitoring panel
+ *   • Identity verification status signal (Verified / Mismatch)
+ *   • identity_mismatch flag in Pending Review banner
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -20,6 +15,7 @@ import { useState, useCallback, useRef } from 'react';
 import { WebcamPreview } from '../components/WebcamPreview';
 import { RiskIndicator } from '../components/RiskIndicator';
 import { EventLog } from '../components/EventLog';
+import { IdentityCaptureModal } from '../components/IdentityCaptureModal';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useBehavioralDetection } from '../hooks/useBehavioralDetection';
 import { useFaceDetection } from '../hooks/useFaceDetection';
@@ -129,8 +125,8 @@ export function ExamPage() {
   const [violations, setViolations] = useState<Violation[]>([]);
   const [lastActivity, setLastActivity] = useState<string>('—');
   const [serverErrorMsg, setServerErrorMsg] = useState<string | null>(null);
+  const [showIdentityModal, setShowIdentityModal] = useState(false);
 
-  // Shared ref for the video element (used by WebcamPreview and useFaceDetection)
   const videoRef = useRef<HTMLVideoElement>(null);
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
@@ -159,15 +155,25 @@ export function ExamPage() {
   const { monitoringState, startMonitoring: startBehavioral, reenterFullscreen } =
     useBehavioralDetection({ sendEvent, wsStatus: status });
 
-  // ── Face detection (Phase 2b) ──────────────────────────────────────────────
-  const { faceState, pendingFlags } = useFaceDetection({
+  // ── Face detection + Identity (Phase 2b/2c) ───────────────────────────────
+  const { faceState, activeFlags, referenceCapture, captureReference } = useFaceDetection({
     videoRef,
     monitoringActive: monitoringState.active,
   });
 
-  const handleStartExam = useCallback(async () => {
+  // ── Exam Start Flow (Phase 2c: identity capture → behavioral monitoring) ──
+  const handleStartExam = useCallback(() => {
+    setShowIdentityModal(true);
+  }, []);
+
+  const handleIdentityConfirmed = useCallback(async () => {
+    setShowIdentityModal(false);
     await startBehavioral();
   }, [startBehavioral]);
+
+  const handleIdentityCancelled = useCallback(() => {
+    setShowIdentityModal(false);
+  }, []);
 
   // ── Clear event log ────────────────────────────────────────────────────────
   const handleClearLog = () => setVisibleLog([]);
@@ -211,8 +217,42 @@ export function ExamPage() {
     orientationStatus = faceState.orientation === 'forward' ? 'ok' : 'warn';
   }
 
+  // ── Identity status formatting ─────────────────────────────────────────────
+  let identityLabel = '—';
+  let identityStatusColor: 'ok' | 'warn' | 'error' | 'off' = 'off';
+
+  if (faceState.identityStatus === 'verified') {
+    identityLabel = `Verified${faceState.identityDistance !== null ? ` (${(faceState.identityDistance).toFixed(2)})` : ''}`;
+    identityStatusColor = 'ok';
+  } else if (faceState.identityStatus === 'mismatch') {
+    identityLabel = `Mismatch${faceState.identityDistance !== null ? ` (${(faceState.identityDistance).toFixed(2)})` : ''}`;
+    identityStatusColor = 'error';
+  } else if (faceState.identityStatus === 'captured') {
+    identityLabel = 'Captured — verifying…';
+    identityStatusColor = 'off';
+  } else if (faceState.identityStatus === 'not_captured') {
+    identityLabel = 'Not captured';
+    identityStatusColor = 'off';
+  }
+
+  // ── Flag label helper ──────────────────────────────────────────────────────
+  const flagLabel = (f: typeof activeFlags[number]) => {
+    if (f.type === 'identity_mismatch') return 'Identity mismatch';
+    if (f.type === 'head_turned') return `Head turned${f.orientation ? ` (looking ${f.orientation})` : ''}`;
+    return f.type.replace(/_/g, ' ');
+  };
+
   return (
     <div className="min-h-screen bg-gray-950 text-white font-sans">
+
+      {/* ── Identity Capture Modal (Phase 2c) ─────────────────────────────── */}
+      {showIdentityModal && (
+        <IdentityCaptureModal
+          onCapture={captureReference}
+          onConfirm={handleIdentityConfirmed}
+          onCancel={handleIdentityCancelled}
+        />
+      )}
 
       {/* ── Sticky header ───────────────────────────────────────────────────── */}
       <header className="border-b border-white/[0.08] bg-gray-900/90 backdrop-blur-md sticky top-0 z-20">
@@ -271,17 +311,16 @@ export function ExamPage() {
         </div>
       )}
 
-      {/* ── Pending Flags (Phase 2b Local Alerts) ─────────────────────────── */}
-      {pendingFlags.length > 0 && (
+      {/* ── Pending Flags (Phase 2b/2c Local Alerts) ──────────────────────── */}
+      {activeFlags.length > 0 && (
         <div className="mx-4 sm:mx-6 mt-3 rounded-xl border border-rose-700/40 bg-rose-950/40 px-4 py-3 flex items-center gap-3">
           <span className="text-xl flex-shrink-0 animate-pulse">🚨</span>
           <div className="flex-1">
             <p className="text-sm font-semibold text-rose-300">Pending Review (Local Only)</p>
             <div className="text-xs text-rose-500 mt-0.5 space-y-1">
-              {pendingFlags.map((f, i) => (
+              {activeFlags.map((f, i) => (
                 <p key={i}>
-                  • {f.type.replace('_', ' ')} ({(f.durationMs / 1000).toFixed(1)}s)
-                  {f.orientation ? ` — looking ${f.orientation}` : ''}
+                  • {flagLabel(f)} — {(f.durationMs / 1000).toFixed(1)}s and counting…
                 </p>
               ))}
             </div>
@@ -323,11 +362,10 @@ export function ExamPage() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-1">
         <div className="rounded-2xl bg-gradient-to-r from-violet-950/60 via-indigo-950/50 to-blue-950/40 border border-violet-700/20 px-5 py-4">
           <p className="text-sm text-gray-300 leading-relaxed">
-            <span className="font-semibold text-white">Phase 2b — Local Face Detection — </span>
-            The browser now runs <span className="text-emerald-400 font-medium">face-api.js</span>{' '}
-            locally on the webcam feed to track face count and head orientation in real time.
-            Suspicious states are flagged locally for review (sending to backend AI is coming in Phase 2c).
-            Tab/clipboard/fullscreen behaviors continue to flow to the backend.
+            <span className="font-semibold text-white">Phase 2c — Identity Verification — </span>
+            A reference face is captured at exam start and continuously compared against the live feed.
+            Identity mismatches are tracked locally. Face detection, orientation, and behavioral signals
+            all run in parallel.
           </p>
         </div>
       </div>
@@ -362,7 +400,7 @@ export function ExamPage() {
                 <div className="text-center">
                   <h2 className="text-sm font-bold text-gray-200 mb-1">Ready to Begin?</h2>
                   <p className="text-xs text-gray-500 leading-relaxed max-w-[220px]">
-                    Clicking below will enter fullscreen mode and begin monitoring for behavioral violations.
+                    Clicking below will verify your identity, enter fullscreen mode, and begin monitoring.
                   </p>
                 </div>
                 <button
@@ -400,9 +438,22 @@ export function ExamPage() {
                   </h2>
                 </div>
 
-                {/* Face AI Signals */}
+                {/* Vision AI Signals */}
                 <div className="space-y-0.5 mb-2 border-b border-white/5 pb-2">
-                  <h3 className="text-[10px] font-bold tracking-wider text-gray-500 uppercase mb-1.5 px-1">Vision AI (Local)</h3>
+                  <div className="flex items-center justify-between mb-1.5 px-1">
+                    <h3 className="text-[10px] font-bold tracking-wider text-gray-500 uppercase">Vision AI (Local)</h3>
+                    {/* Reference thumbnail */}
+                    {referenceCapture && (
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[9px] text-gray-600 uppercase tracking-wider">Ref</span>
+                        <img
+                          src={referenceCapture.thumbnailDataUrl}
+                          alt="Reference face"
+                          className="w-6 h-6 rounded-md object-cover border border-gray-600"
+                        />
+                      </div>
+                    )}
+                  </div>
                   <SignalRow
                     label="Face Detection"
                     icon="👤"
@@ -414,6 +465,12 @@ export function ExamPage() {
                     icon="🧭"
                     value={<span className="capitalize">{orientationLabel}</span>}
                     status={orientationStatus}
+                  />
+                  <SignalRow
+                    label="Identity Match"
+                    icon="🔐"
+                    value={identityLabel}
+                    status={identityStatusColor}
                   />
                 </div>
 
@@ -531,7 +588,7 @@ export function ExamPage() {
       {/* ── Footer ──────────────────────────────────────────────────────────── */}
       <footer className="border-t border-white/[0.07] mt-4 py-4 px-4 sm:px-6">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-gray-700">
-          <span>Autonomous Proctoring Agent · Phase 2b</span>
+          <span>Autonomous Proctoring Agent · Phase 2c</span>
           <span>Powered by Cloudflare Workers AI · Durable Objects · WebSockets</span>
         </div>
       </footer>
