@@ -251,6 +251,7 @@ export function ExamPage() {
           onCapture={captureReference}
           onConfirm={handleIdentityConfirmed}
           onCancel={handleIdentityCancelled}
+          videoRef={videoRef}
         />
       )}
 
