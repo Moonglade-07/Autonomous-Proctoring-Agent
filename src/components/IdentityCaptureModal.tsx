@@ -41,15 +41,15 @@ type ModalStep = 'live' | 'capturing' | 'captured';
 
 // ─── Oval dimensions (relative to the video container) ──────────────────────
 
-const OVAL_WIDTH_RATIO = 0.45;  // 45% of container width
+const OVAL_WIDTH_RATIO = 0.35;  // 35% of container width (passport-photo style)
 const OVAL_HEIGHT_RATIO = 0.65; // 65% of container height
 
 // ─── Quality assessment ─────────────────────────────────────────────────────
 
 function assessQuality(
   detection: faceapi.WithFaceLandmarks<{ detection: faceapi.FaceDetection }> | null,
-  containerW: number,
-  containerH: number,
+  videoW: number,
+  videoH: number,
 ): QualityState {
   if (!detection) {
     return { level: 'none', hint: 'No face detected — position your face in the oval' };
@@ -73,54 +73,55 @@ function assessQuality(
     const faceWidth = Math.abs(rightEyeOuter.x - leftEyeOuter.x);
 
     if (faceWidth > 10) {
+      // NOTE: faceapi processes the unmirrored raw video.
       const yawRatio = (noseTip.x - eyeCenterX) / faceWidth;
       const eyeToChinDist = chin.y - eyeCenterY;
       const eyeToNoseDist = noseTip.y - eyeCenterY;
       const pitchRatio = eyeToChinDist > 10 ? eyeToNoseDist / eyeToChinDist : 0;
 
-      if (Math.abs(yawRatio) > 0.3) {
+      if (Math.abs(yawRatio) > 0.35) {
         return { level: 'poor', hint: 'Look straight at the camera' };
       }
       if (pitchRatio > 0.7 || pitchRatio < 0.3) {
         return { level: 'poor', hint: 'Look straight at the camera' };
       }
-      // Borderline yaw
-      if (Math.abs(yawRatio) > 0.18) {
+      // Borderline yaw (relaxed from 0.18)
+      if (Math.abs(yawRatio) > 0.25) {
         return { level: 'borderline', hint: 'Almost — face the camera a bit more' };
       }
     }
   }
 
-  // Size check — face should be a reasonable proportion of the oval
-  const ovalW = containerW * OVAL_WIDTH_RATIO;
-  const ovalH = containerH * OVAL_HEIGHT_RATIO;
-  const faceToOvalWidthRatio = box.width / ovalW;
-  const faceToOvalHeightRatio = box.height / ovalH;
+  // Normalize face center (0.0 to 1.0) relative to raw video dimensions
+  const faceCX = (box.x + box.width / 2) / videoW;
+  const faceCY = (box.y + box.height / 2) / videoH;
 
-  if (faceToOvalWidthRatio < 0.35 || faceToOvalHeightRatio < 0.35) {
-    return { level: 'poor', hint: 'Move closer to the camera' };
-  }
-  if (faceToOvalWidthRatio > 1.3 || faceToOvalHeightRatio > 1.3) {
-    return { level: 'poor', hint: 'Move further from the camera' };
-  }
+  // The video is mirrored for the user, so a face on the left side of the raw video (faceCX < 0.5)
+  // appears on the right side of the UI. We flip X to match what the user sees.
+  const visibleCX = 1 - faceCX;
 
-  // Center check — face center should be near oval center
-  const faceCX = box.x + box.width / 2;
-  const faceCY = box.y + box.height / 2;
-  const ovalCX = containerW / 2;
-  const ovalCY = containerH / 2;
-  const offX = Math.abs(faceCX - ovalCX) / ovalW;
-  const offY = Math.abs(faceCY - ovalCY) / ovalH;
+  // Center check — oval is exactly in the center (0.5, 0.5)
+  const offX = Math.abs(visibleCX - 0.5);
+  const offY = Math.abs(faceCY - 0.5);
 
-  if (offX > 0.35 || offY > 0.35) {
+  if (offX > 0.15 || offY > 0.15) {
     return { level: 'poor', hint: 'Center your face in the oval' };
   }
-  if (offX > 0.2 || offY > 0.2) {
+  if (offX > 0.08 || offY > 0.08) {
     return { level: 'borderline', hint: 'Almost centered — adjust slightly' };
   }
 
-  // Borderline size
-  if (faceToOvalWidthRatio < 0.5 || faceToOvalHeightRatio < 0.5) {
+  // Size check — using face height relative to video height
+  // The oval is 65% of container height. We want the face to fill a good portion of it.
+  const faceToVideoHeightRatio = box.height / videoH;
+
+  if (faceToVideoHeightRatio < 0.30) {
+    return { level: 'poor', hint: 'Move closer to the camera' };
+  }
+  if (faceToVideoHeightRatio > 0.75) {
+    return { level: 'poor', hint: 'Move further from the camera' };
+  }
+  if (faceToVideoHeightRatio < 0.40) {
     return { level: 'borderline', hint: 'A little closer would be better' };
   }
 
@@ -151,11 +152,10 @@ export function IdentityCaptureModal({ onCapture, onConfirm, onCancel, videoRef 
         .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 }))
         .withFaceLandmarks(true); // tiny landmarks — fast
 
-      const rect = container.getBoundingClientRect();
       const q = assessQuality(
         detection ?? null,
-        rect.width,
-        rect.height,
+        video.videoWidth,
+        video.videoHeight,
       );
       if (activeRef.current) {
         setQuality(q);
