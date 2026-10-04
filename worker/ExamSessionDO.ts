@@ -357,8 +357,18 @@ Only respond with the JSON object.`;
         20_000 // 20-second timeout
       );
 
-      // The model returns { response: string } — extract and parse the JSON
-      const text = (response as { response: string }).response?.trim() ?? '';
+      // The model returns { response: string } — extract and parse the JSON safely
+      let text = '';
+      if (typeof response === 'string') {
+        text = response;
+      } else if (response && typeof (response as any).response === 'string') {
+        text = (response as any).response;
+      } else {
+        // Fallback if the AI binding returned a raw object (can happen with certain models/load)
+        text = JSON.stringify((response as any).response ?? response);
+      }
+      text = text.trim();
+
       // Strip markdown code fences the model may add despite system prompt instructions
       const jsonStr = text.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
       const parsed = JSON.parse(jsonStr) as { score: number; explanation: string; confidence: number };
