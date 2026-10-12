@@ -8,6 +8,7 @@
 	"main": "worker/index.ts",
 	"compatibility_date": "2026-09-25",
 	"assets": {
+		"binding": "ASSETS",
 		"not_found_handling": "single-page-application"
 	},
 	"observability": {
@@ -22,22 +23,30 @@
 	},
 
 	// ── Durable Objects ─────────────────────────────────────────────────────
-	// One class handles all exam sessions; each session gets its own DO instance.
 	"durable_objects": {
 		"bindings": [
 			{
 				"name": "EXAM_SESSION",
 				"class_name": "ExamSessionDO"
+			},
+			{
+				"name": "EXAM_HUB",
+				"class_name": "ExamHubDO"
 			}
 		]
 	},
 
 	// ── Migrations ──────────────────────────────────────────────────────────
-	// Required the first time a Durable Object class is deployed.
+	// v1: initial ExamSessionDO
+	// v2: adds ExamHubDO (Phase 3a professor live monitor)
 	"migrations": [
 		{
 			"tag": "v1",
 			"new_sqlite_classes": ["ExamSessionDO"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["ExamHubDO"]
 		}
 	]
 }

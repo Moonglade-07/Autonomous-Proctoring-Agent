@@ -14,7 +14,9 @@ export type BehavioralEventType =
   | 'multiple_faces'
   | 'orientation_away'
   | 'identity_mismatch'
-  | 'normal';
+  | 'normal'
+  | 'thumbnail'
+  | 'submit';
 
 /** Payload sent alongside clipboard_activity events. */
 export interface ClipboardPayload {
@@ -58,7 +60,7 @@ export interface ExamSessionState {
 /** Messages sent FROM frontend TO backend DO */
 export interface BehavioralEventMsg {
   eventType: BehavioralEventType;
-  payload?: ClipboardPayload | VisionEventPayload;
+  payload?: ClipboardPayload | VisionEventPayload | ThumbnailPayload;
 }
 
 /** Messages sent FROM backend DO TO frontend */
@@ -76,4 +78,80 @@ export type WSOutboundMsg =
   | {
       type: 'error';
       message: string;
+    };
+
+// ─── Phase 3a: Hub types ─────────────────────────────────────────────────────
+
+/**
+ * Lightweight per-student summary stored and broadcast by ExamHubDO.
+ * Omits full riskHistory to keep WebSocket messages small.
+ */
+export interface SessionSummary {
+  /** The student's unique session ID */
+  sessionId: string;
+  /** Human-readable name from the ?name= query param */
+  studentName: string;
+  /** Current cumulative risk score (0–100) */
+  riskScore: number;
+  /** Whether the student is still connected, has disconnected, or submitted */
+  status: 'active' | 'disconnected' | 'submitted';
+  /** Total number of violations recorded so far */
+  violationCount: number;
+  /** The most recent event type (e.g. 'tab_switch', 'no_face') */
+  lastEventType: string;
+  /** ISO timestamp of the last event */
+  lastEventAt: string;
+  /** Timestamp when session started, for time active calculation */
+  startedAt?: string;
+  /** Latest webcam thumbnail (tiny JPEG, base64, optional) */
+  thumbnailBase64?: string;
+  /** The examId this session belongs to */
+  examId: string;
+  /** Recent violations for the detail drawer */
+  recentViolations?: Violation[];
+}
+
+/**
+ * A single proctoring alert pushed from a student session to the hub,
+ * then broadcast to all connected professors.
+ */
+export interface HubAlert {
+  sessionId: string;
+  studentName: string;
+  eventType: string;
+  severity: Violation['severity'];
+  durationSeconds?: number;
+  aiExplanation: string;
+  timestamp: string;
+}
+
+/** Thumbnail payload sent from student to DO, forwarded to hub only. */
+export interface ThumbnailPayload {
+  thumbnailBase64: string;
+}
+
+/** Body of POST /session-event sent from ExamSessionDO to ExamHubDO. */
+export interface HubInternalUpdate {
+  summary: SessionSummary;
+  alert?: HubAlert;
+}
+
+/** Messages sent FROM ExamHubDO TO professor WebSocket clients. */
+export type HubOutboundMsg =
+  | {
+      type: 'snapshot';
+      sessions: Record<string, SessionSummary>;
+      alerts: HubAlert[];
+    }
+  | {
+      type: 'session_updated' | 'session_update';
+      summary: SessionSummary;
+    }
+  | {
+      type: 'session_removed';
+      sessionId: string;
+    }
+  | {
+      type: 'alert';
+      alert: HubAlert;
     };

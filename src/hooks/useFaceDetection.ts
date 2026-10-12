@@ -13,7 +13,7 @@
 
 import { useEffect, useRef, useState, useCallback, type RefObject } from 'react';
 import * as faceapi from 'face-api.js';
-import type { BehavioralEventType, ClipboardPayload, VisionEventPayload } from '../types';
+import type { BehavioralEventType, ClipboardPayload, VisionEventPayload, ThumbnailPayload } from '../types';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -26,8 +26,12 @@ const DETECTION_INTERVAL_MS = 700;
 /** Interval between identity verification passes (ms) — more expensive */
 const IDENTITY_CHECK_INTERVAL_MS = 7000;
 
+/** Interval between live thumbnail snapshots sent to professor hub (ms) */
+const THUMBNAIL_INTERVAL_MS = 12000;
+
 /** Euclidean distance threshold for identity match (lower = stricter) */
 const IDENTITY_MATCH_THRESHOLD = 0.6;
+
 
 /** Suspicious-state thresholds (ms) */
 const NO_FACE_THRESHOLD_MS = 3000;
@@ -145,7 +149,7 @@ function captureVideoThumbnail(video: HTMLVideoElement, size = 120): string {
 interface UseFaceDetectionOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
   monitoringActive: boolean;
-  sendEvent?: (type: BehavioralEventType, payload?: ClipboardPayload | VisionEventPayload) => void;
+  sendEvent?: (type: BehavioralEventType, payload?: ClipboardPayload | VisionEventPayload | ThumbnailPayload) => void;
 }
 
 export function useFaceDetection({ videoRef, monitoringActive, sendEvent }: UseFaceDetectionOptions) {
@@ -418,7 +422,7 @@ export function useFaceDetection({ videoRef, monitoringActive, sendEvent }: UseF
     } catch (err) {
       console.error('[useFaceDetection] Detection pass error:', err);
     }
-  }, [videoRef, finalizeFlag]);
+  }, [videoRef, finalizeFlag, captureEvidence, sendEvent]);
 
   // ─── Identity verification pass (runs less frequently) ────────────────────
 
@@ -496,7 +500,7 @@ export function useFaceDetection({ videoRef, monitoringActive, sendEvent }: UseF
     } catch (err) {
       console.error('[useFaceDetection] Identity check error:', err);
     }
-  }, [videoRef, finalizeFlag]);
+  }, [videoRef, finalizeFlag, captureEvidence, sendEvent]);
 
   // ─── Detection loop (face count + orientation — Phase 2b) ─────────────────
 
@@ -565,7 +569,7 @@ export function useFaceDetection({ videoRef, monitoringActive, sendEvent }: UseF
       });
       trackersRef.current = { noFace: null, multiFace: null, headTurned: null, headTurnDir: 'unknown', identityMismatch: null };
     };
-  }, [monitoringActive, state.modelState, runDetection]);
+  }, [monitoringActive, state.modelState, runDetection, sendEvent]);
 
   // ─── Identity verification loop (Phase 2c — runs less frequently) ─────────
 
@@ -598,6 +602,40 @@ export function useFaceDetection({ videoRef, monitoringActive, sendEvent }: UseF
       }
     };
   }, [monitoringActive, state.modelState, runIdentityCheck, referenceCapture]);
+
+  // ─── Phase 3a: Periodic low-res webcam thumbnail sender ───────────────────
+  useEffect(() => {
+    if (!monitoringActive || !sendEvent) return;
+
+    const captureAndSend = () => {
+      if (document.hidden) return;
+      const video = videoRef.current;
+      if (!video || video.readyState < 2) return;
+
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = 160;
+        canvas.height = 120;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, 160, 120);
+          const thumbnailBase64 = canvas.toDataURL('image/jpeg', 0.6);
+          sendEvent('thumbnail', { thumbnailBase64 });
+        }
+      } catch (err) {
+        console.warn('[FaceDetection] Failed to capture live thumbnail', err);
+      }
+    };
+
+    // Send first snapshot soon after monitoring starts (1.2s), then periodically
+    const initialTimer = window.setTimeout(captureAndSend, 1200);
+    const intervalTimer = window.setInterval(captureAndSend, THUMBNAIL_INTERVAL_MS);
+
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(intervalTimer);
+    };
+  }, [monitoringActive, sendEvent, videoRef]);
 
   // ─── Auto-load models ─────────────────────────────────────────────────────
 

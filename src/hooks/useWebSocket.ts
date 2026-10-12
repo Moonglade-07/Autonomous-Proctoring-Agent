@@ -11,16 +11,18 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { BehavioralEventType, ClipboardPayload, VisionEventPayload, WSOutboundMsg } from '../types';
+import type { BehavioralEventType, ClipboardPayload, VisionEventPayload, ThumbnailPayload, WSOutboundMsg } from '../types';
 
 type WSStatus = 'connecting' | 'open' | 'closed' | 'error';
 
 interface UseWebSocketOptions {
   sessionId: string;
+  examId?: string;
+  studentName?: string;
   onMessage: (msg: WSOutboundMsg) => void;
 }
 
-export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
+export function useWebSocket({ sessionId, examId, studentName, onMessage }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<WSStatus>('connecting');
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -29,9 +31,13 @@ export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
 
-    // Determine WebSocket URL — same host, /api/exam/:sessionId
+    // Determine WebSocket URL — same host, /api/exam/:sessionId?examId=...&name=...
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/exam/${sessionId}`;
+    const params = new URLSearchParams();
+    if (examId) params.set('examId', examId);
+    if (studentName) params.set('name', studentName);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    const wsUrl = `${protocol}//${window.location.host}/api/exam/${sessionId}${qs}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -63,7 +69,7 @@ export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
         }, 3000);
       }
     };
-  }, [sessionId, onMessage]);
+  }, [sessionId, examId, studentName, onMessage]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -78,12 +84,18 @@ export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
 
   /**
    * Send a behavioral event to the Durable Object.
-   * Optionally includes a payload (e.g., clipboard action details).
+   * Optionally includes a payload (e.g., clipboard action details or thumbnail).
    */
   const sendEvent = useCallback(
-    (eventType: BehavioralEventType, payload?: ClipboardPayload | VisionEventPayload) => {
+    (
+      eventType: BehavioralEventType,
+      payload?: ClipboardPayload | VisionEventPayload | ThumbnailPayload
+    ) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        const msg: { eventType: BehavioralEventType; payload?: ClipboardPayload | VisionEventPayload } = { eventType };
+        const msg: {
+          eventType: BehavioralEventType;
+          payload?: ClipboardPayload | VisionEventPayload | ThumbnailPayload;
+        } = { eventType };
         if (payload) msg.payload = payload;
         wsRef.current.send(JSON.stringify(msg));
       } else {

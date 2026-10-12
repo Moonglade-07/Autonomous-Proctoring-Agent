@@ -1,16 +1,16 @@
 /**
  * RiskIndicator.tsx
  * Displays the current risk score with color-coded levels:
- *   GREEN  — score < 30  (low risk)
- *   YELLOW — score 30–70 (medium risk)
- *   RED    — score > 70  (high risk)
+ *   GREEN  — score < 40  (low risk)
+ *   YELLOW — score 40–70 (medium risk)
+ *   RED    — score >= 70 (high risk)
  */
 
 interface RiskIndicatorProps {
   score: number;
 }
 
-function getRiskLevel(score: number): { label: string; color: string; bg: string; ring: string; glow: string } {
+export function getRiskLevel(score: number): { label: string; color: string; bg: string; ring: string; glow: string } {
   if (score >= 70) {
     return {
       label: 'HIGH RISK',
@@ -20,7 +20,7 @@ function getRiskLevel(score: number): { label: string; color: string; bg: string
       glow: 'shadow-red-500/30',
     };
   }
-  if (score >= 30) {
+  if (score >= 40) {
     return {
       label: 'MEDIUM RISK',
       color: 'text-yellow-400',
@@ -46,7 +46,7 @@ function ScoreGauge({ score }: { score: number }) {
   const offset = circumference - (score / 100) * circumference;
 
   const strokeColor =
-    score >= 70 ? '#f87171' : score >= 30 ? '#facc15' : '#34d399';
+    score >= 70 ? '#f87171' : score >= 40 ? '#facc15' : '#34d399';
 
   return (
     <svg className="w-40 h-40 -rotate-90" viewBox="0 0 120 120">

@@ -11,6 +11,7 @@
  */
 
 import { useState, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { WebcamPreview } from '../components/WebcamPreview';
 import { RiskIndicator } from '../components/RiskIndicator';
 import { EventLog } from '../components/EventLog';
@@ -126,6 +127,18 @@ export function ExamPage() {
   const [serverErrorMsg, setServerErrorMsg] = useState<string | null>(null);
   const [showIdentityModal, setShowIdentityModal] = useState(false);
 
+  // Phase 3a: examId, studentName, and submission state
+  const [examId] = useState<string>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get('exam') || sp.get('examId') || 'exam-1';
+  });
+  const [studentName, setStudentName] = useState<string>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get('name') || `Student-${SESSION_ID.slice(-4)}`;
+  });
+  const [isSubmitted, setIsSubmitted] = useState(false);
+  const [showSubmitModal, setShowSubmitModal] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement>(null);
 
   // ── WebSocket ──────────────────────────────────────────────────────────────
@@ -148,16 +161,21 @@ export function ExamPage() {
     }
   }, []);
 
-  const { sendEvent, status } = useWebSocket({ sessionId: SESSION_ID, onMessage: handleMessage });
+  const { sendEvent, status } = useWebSocket({
+    sessionId: SESSION_ID,
+    examId,
+    studentName,
+    onMessage: handleMessage,
+  });
 
   // ── Behavioral detection (Phase 2a) ────────────────────────────────────────
-  const { monitoringState, startMonitoring: startBehavioral, reenterFullscreen } =
+  const { monitoringState, startMonitoring: startBehavioral, stopMonitoring, reenterFullscreen } =
     useBehavioralDetection({ sendEvent, wsStatus: status });
 
   // ── Face detection + Identity (Phase 2b/2c) ───────────────────────────────
   const { faceState, activeFlags, referenceCapture, captureReference } = useFaceDetection({
     videoRef,
-    monitoringActive: monitoringState.active,
+    monitoringActive: monitoringState.active && !isSubmitted,
     sendEvent,
   });
 
@@ -174,6 +192,14 @@ export function ExamPage() {
   const handleIdentityCancelled = useCallback(() => {
     setShowIdentityModal(false);
   }, []);
+
+  // ── Phase 3a: Submit exam ──────────────────────────────────────────────────
+  const handleConfirmSubmit = useCallback(async () => {
+    setShowSubmitModal(false);
+    setIsSubmitted(true);
+    sendEvent('submit');
+    stopMonitoring();
+  }, [sendEvent, stopMonitoring]);
 
   // ── Clear event log ────────────────────────────────────────────────────────
   const handleClearLog = () => setVisibleLog([]);
@@ -255,6 +281,37 @@ export function ExamPage() {
         />
       )}
 
+      {/* ── Submit Confirmation Modal (Phase 3a) ──────────────────────────── */}
+      {showSubmitModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="max-w-md w-full bg-gray-900 border border-white/10 rounded-2xl p-6 shadow-2xl">
+            <div className="w-12 h-12 rounded-xl bg-red-500/20 text-red-400 flex items-center justify-center text-2xl mx-auto mb-4 border border-red-500/30">
+              🏁
+            </div>
+            <h3 className="text-base font-bold text-white text-center mb-2">
+              Submit and Finish Exam?
+            </h3>
+            <p className="text-xs text-gray-400 text-center leading-relaxed mb-6">
+              This will end all proctoring telemetry, finalize your score, and notify the professor live monitor that your exam is complete.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowSubmitModal(false)}
+                className="flex-1 py-2.5 px-4 rounded-xl text-xs font-semibold bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors cursor-pointer"
+              >
+                Continue Exam
+              </button>
+              <button
+                onClick={handleConfirmSubmit}
+                className="flex-1 py-2.5 px-4 rounded-xl text-xs font-bold bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-600/30 transition-colors cursor-pointer"
+              >
+                Confirm Submit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Sticky header ───────────────────────────────────────────────────── */}
       <header className="border-b border-white/[0.08] bg-gray-900/90 backdrop-blur-md sticky top-0 z-20">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
@@ -263,10 +320,17 @@ export function ExamPage() {
               AP
             </div>
             <div className="min-w-0">
-              <h1 className="text-sm font-bold text-white tracking-wide truncate">
-                Autonomous Proctoring Agent
-              </h1>
-              <p className="text-xs text-gray-600 font-mono truncate">Session: {SESSION_ID}</p>
+              <div className="flex items-center gap-2">
+                <h1 className="text-sm font-bold text-white tracking-wide truncate">
+                  Autonomous Proctoring Agent
+                </h1>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-violet-500/20 text-violet-300 border border-violet-500/30">
+                  {examId}
+                </span>
+              </div>
+              <p className="text-xs text-gray-500 font-mono truncate">
+                {studentName} · Session: {SESSION_ID}
+              </p>
             </div>
           </div>
 
@@ -287,6 +351,14 @@ export function ExamPage() {
               </span>
             )}
             <WSStatusDot status={status} />
+            <Link
+              to={`/professor?exam=${encodeURIComponent(examId)}`}
+              target="_blank"
+              className="text-xs px-2.5 py-1 rounded-lg bg-violet-500/10 hover:bg-violet-500/20 text-violet-300 border border-violet-500/30 font-medium flex items-center gap-1 transition-colors"
+            >
+              <span>Live Monitor</span>
+              <span>↗</span>
+            </Link>
           </div>
         </div>
       </header>
@@ -395,15 +467,55 @@ export function ExamPage() {
 
           {/* Start Exam / Monitoring panel */}
           <div className="rounded-2xl bg-gray-900/60 border border-white/[0.07] p-4">
-            {!monitoringState.active ? (
-              /* ── Pre-exam: Start button ──────────────────────────────── */
-              <div className="flex flex-col items-center py-4 gap-4">
-                <div className="text-center">
-                  <h2 className="text-sm font-bold text-gray-200 mb-1">Ready to Begin?</h2>
-                  <p className="text-xs text-gray-500 leading-relaxed max-w-[220px]">
-                    Clicking below will verify your identity, enter fullscreen mode, and begin monitoring.
+            {isSubmitted ? (
+              /* ── Submitted view ────────────────────────────────────────── */
+              <div className="flex flex-col items-center py-6 text-center gap-3">
+                <div className="w-12 h-12 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center text-2xl border border-blue-500/30">
+                  🏁
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Exam Completed & Submitted</h3>
+                  <p className="text-xs text-gray-400 mt-1 max-w-[240px]">
+                    Your session is finalized and reported to the Professor Live Monitor.
                   </p>
                 </div>
+                <div className="flex items-center gap-2 mt-2">
+                  <span className="text-xs bg-blue-500/10 text-blue-300 border border-blue-500/30 px-2.5 py-1 rounded-full font-mono">
+                    Status: Submitted
+                  </span>
+                  <Link
+                    to={`/professor?exam=${encodeURIComponent(examId)}`}
+                    target="_blank"
+                    className="text-xs px-3 py-1 rounded-full bg-violet-600 hover:bg-violet-500 text-white font-semibold transition-colors flex items-center gap-1"
+                  >
+                    <span>View Monitor</span>
+                    <span>↗</span>
+                  </Link>
+                </div>
+              </div>
+            ) : !monitoringState.active ? (
+              /* ── Pre-exam: Student Name + Start button ──────────────────── */
+              <div className="flex flex-col items-center py-4 gap-3.5">
+                <div className="text-center">
+                  <h2 className="text-sm font-bold text-gray-200 mb-1">Ready to Begin?</h2>
+                  <p className="text-xs text-gray-500 leading-relaxed max-w-[240px]">
+                    Confirm your details, verify identity via webcam, and enter fullscreen exam mode.
+                  </p>
+                </div>
+
+                <div className="w-full text-left">
+                  <label className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider block mb-1">
+                    Student Name
+                  </label>
+                  <input
+                    type="text"
+                    value={studentName}
+                    onChange={(e) => setStudentName(e.target.value)}
+                    placeholder="Enter your name"
+                    className="w-full bg-gray-800 border border-white/10 rounded-lg px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
+                  />
+                </div>
+
                 <button
                   id="start-exam-btn"
                   onClick={handleStartExam}
@@ -476,7 +588,7 @@ export function ExamPage() {
                 </div>
 
                 {/* Behavioral Signals */}
-                <div className="space-y-0.5">
+                <div className="space-y-0.5 mb-3">
                   <h3 className="text-[10px] font-bold tracking-wider text-gray-500 uppercase mb-1.5 px-1 pt-1">Behavior (Backend)</h3>
                   <SignalRow
                     label="Tab Focus"
@@ -503,6 +615,16 @@ export function ExamPage() {
                     status={monitoringState.rightClickCount > 0 ? 'warn' : 'ok'}
                   />
                 </div>
+
+                {/* Submit & Finish Exam button */}
+                <button
+                  id="submit-exam-btn"
+                  onClick={() => setShowSubmitModal(true)}
+                  className="w-full py-2.5 px-4 rounded-xl text-xs font-bold text-red-300 bg-red-950/60 hover:bg-red-900/80 border border-red-700/50 hover:border-red-500/80 transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <span>🏁</span>
+                  <span>Finish & Submit Exam</span>
+                </button>
               </div>
             )}
           </div>

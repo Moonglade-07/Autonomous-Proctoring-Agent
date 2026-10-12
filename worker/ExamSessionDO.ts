@@ -13,6 +13,7 @@
  *     3. Calling Workers AI (Llama 3.3-70B) to produce a risk score + explanation.
  *     4. Updating and persisting session state to Durable Object Storage.
  *     5. Broadcasting the AI result back to all connected WebSocket clients.
+ *     6. (Phase 3a) Reporting session summaries and alerts to ExamHubDO.
  *
  * WebSocket API choice:
  *   We use `server.accept()` (non-hibernatable mode) together with `addEventListener`.
@@ -38,6 +39,10 @@ import type {
   ExamSessionState,
   BehavioralEventMsg,
   WSOutboundMsg,
+  SessionSummary,
+  HubAlert,
+  HubInternalUpdate,
+  ThumbnailPayload,
 } from './types.js';
 
 // ─── Module-level helpers ────────────────────────────────────────────────────
@@ -131,6 +136,14 @@ export class ExamSessionDO implements DurableObject {
   /** Set of all currently open WebSocket connections to this DO instance. */
   private sockets: Set<WebSocket> = new Set();
 
+  /** Phase 3a: examId and studentName read from connection query params. */
+  private examId = 'exam-1';
+  private studentName = '';
+  private startedAt = new Date().toISOString();
+
+  /** Phase 3a: latest webcam thumbnail (tiny, forwarded from student). */
+  private latestThumbnail: string | undefined;
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -171,7 +184,8 @@ export class ExamSessionDO implements DurableObject {
    * Handles:
    *   • WebSocket upgrade requests → completes the WebSocket handshake and
    *     sets up message/close/error listeners.
-   *   • All other requests → returns 426 Upgrade Required.
+   *   • GET /history              → returns full riskHistory (for professor detail view).
+   *   • All other requests        → returns 426 Upgrade Required.
    *
    * @param request - The forwarded HTTP request from the Worker.
    * @returns A 101 Switching Protocols response with the client-side WebSocket,
@@ -183,9 +197,24 @@ export class ExamSessionDO implements DurableObject {
 
     await this.initialize(sessionId);
 
+    // ── Phase 3a: GET /history endpoint ─────────────────────────────────────
+    if (url.pathname.endsWith('/history') && request.method === 'GET') {
+      return Response.json({
+        sessionId: this.session.sessionId,
+        riskScore: this.session.riskScore,
+        riskHistory: this.session.riskHistory,
+        violations: this.session.violations,
+      });
+    }
+
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected WebSocket upgrade', { status: 426 });
     }
+
+    // Phase 3a: read examId and studentName from query params
+    this.examId = url.searchParams.get('examId') ?? 'exam-1';
+    const rawName = url.searchParams.get('name') ?? '';
+    this.studentName = rawName || `Student-${sessionId.slice(0, 6)}`;
 
     // Create a WebSocket pair: client is returned to the browser,
     // server stays inside this DO and receives all incoming messages.
@@ -207,6 +236,8 @@ export class ExamSessionDO implements DurableObject {
 
     server.addEventListener('close', () => {
       this.sockets.delete(server);
+      // Phase 3a: notify hub that student disconnected
+      this.reportToHub(undefined, 'disconnected').catch(() => {});
     });
 
     server.addEventListener('error', (err) => {
@@ -221,6 +252,9 @@ export class ExamSessionDO implements DurableObject {
       session: this.session,
     } satisfies WSOutboundMsg);
 
+    // Phase 3a: notify hub that a student connected
+    this.reportToHub(undefined, 'active').catch(() => {});
+
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -231,11 +265,13 @@ export class ExamSessionDO implements DurableObject {
    *
    * Pipeline:
    *   1. Parse the JSON payload as a `BehavioralEventMsg`.
-   *   2. Apply a naive risk delta (fast, pre-AI estimate).
-   *   3. Call Workers AI to get a refined score + explanation.
-   *   4. Append the new `RiskEvent` and (if applicable) `Violation` to session state.
-   *   5. Persist the updated session to Durable Object Storage.
-   *   6. Broadcast the `risk_update` message to all connected WebSocket clients.
+   *   2. Handle thumbnail messages (Phase 3a) — forward to hub, skip AI.
+   *   3. Apply a naive risk delta (fast, pre-AI estimate).
+   *   4. Call Workers AI to get a refined score + explanation.
+   *   5. Append the new `RiskEvent` and (if applicable) `Violation` to session state.
+   *   6. Persist the updated session to Durable Object Storage.
+   *   7. Broadcast the `risk_update` message to all connected WebSocket clients.
+   *   8. (Phase 3a) Report updated summary + optional alert to ExamHubDO.
    *
    * @param socket - The server-side WebSocket that sent this message.
    * @param evt    - The raw MessageEvent from the WebSocket listener.
@@ -251,6 +287,24 @@ export class ExamSessionDO implements DurableObject {
     }
 
     const { eventType, payload } = msg;
+
+    // Phase 3a: thumbnail-only message — forward to hub, no AI processing
+    if (eventType === ('thumbnail' as string) && payload && 'thumbnailBase64' in payload) {
+      this.latestThumbnail = (payload as ThumbnailPayload).thumbnailBase64;
+      // Forward to hub only (no AI, no storage)
+      this.reportToHub(undefined, 'active').catch(() => {});
+      return;
+    }
+
+    // Phase 3a: submit exam event — update status in hub and acknowledge
+    if (eventType === ('submit' as string)) {
+      this.reportToHub(undefined, 'submitted').catch(() => {});
+      this.send(socket, {
+        type: 'session_snapshot',
+        session: this.session,
+      } satisfies WSOutboundMsg);
+      return;
+    }
 
     // Step 1: Naive risk delta (applied before AI so state always progresses)
     const delta = RISK_DELTAS[eventType] ?? 0;
@@ -291,7 +345,7 @@ export class ExamSessionDO implements DurableObject {
     }
     const aiResult = await this.callWorkersAI(eventType + payloadContext, this.session.riskScore, rawNewScore);
 
-    // Step 3: Build the risk event record
+    // Step 4: Build the risk event record
     const now = new Date().toISOString();
     const riskEvent: RiskEvent = {
       timestamp: now,
@@ -300,12 +354,13 @@ export class ExamSessionDO implements DurableObject {
       aiExplanation: aiResult.explanation,
     };
 
-    // Step 4: Update in-memory state
+    // Step 5: Update in-memory state
     this.session.riskScore = aiResult.score;
     this.session.riskHistory = [...this.session.riskHistory, riskEvent].slice(-50);
 
+    let newViolation: Violation | undefined;
     if (eventType !== 'normal') {
-      const violation: Violation = {
+      newViolation = {
         id: uid(),
         sessionId: this.session.sessionId,
         type: VIOLATION_TYPE_MAP[eventType] ?? 'system',
@@ -314,21 +369,85 @@ export class ExamSessionDO implements DurableObject {
         aiConfidence: aiResult.confidence,
         humanReviewed: false,
       };
-      this.session.violations = [...this.session.violations, violation].slice(-100);
+      this.session.violations = [...this.session.violations, newViolation].slice(-100);
     }
 
-    // Step 5: Persist to Durable Object Storage
+    // Step 6: Persist to Durable Object Storage
     // This call survives DO evictions — if the runtime reclaims this DO's memory,
     // the next `initialize()` call will restore state from here.
     await this.state.storage.put('session', this.session);
 
-    // Step 6: Broadcast AI result to all connected clients
+    // Step 7: Broadcast AI result to all connected clients
     this.broadcast({
       type: 'risk_update',
       riskScore: this.session.riskScore,
       riskEvent,
       violations: this.session.violations,
     } satisfies WSOutboundMsg);
+
+    // Step 8: Phase 3a — Report to ExamHubDO (fire and forget)
+    let hubAlert: HubAlert | undefined;
+    if (newViolation && eventType !== 'normal') {
+      hubAlert = {
+        sessionId: this.session.sessionId,
+        studentName: this.studentName,
+        eventType,
+        severity: newViolation.severity,
+        durationSeconds: (payload && 'durationSeconds' in payload)
+          ? payload.durationSeconds
+          : undefined,
+        aiExplanation: aiResult.explanation,
+        timestamp: now,
+      };
+    }
+    this.reportToHub(hubAlert, 'active').catch(() => {});
+  }
+
+  // ─── Phase 3a: Hub reporting ─────────────────────────────────────────────
+
+  /**
+   * Reports the current session summary (and optionally an alert) to the ExamHubDO.
+   * Fire-and-forget — errors are suppressed so the student's flow is never blocked.
+   *
+   * @param alert  - Optional violation alert to push to the professor feed.
+   * @param status - The student's current session status.
+   */
+  private async reportToHub(
+    alert: HubAlert | undefined,
+    status: SessionSummary['status']
+  ): Promise<void> {
+    try {
+      const summary: SessionSummary = {
+        sessionId: this.session.sessionId,
+        studentName: this.studentName,
+        riskScore: this.session.riskScore,
+        status,
+        violationCount: this.session.violations.length,
+        lastEventType: this.session.riskHistory.at(-1)?.triggers[0] ?? '',
+        lastEventAt: this.session.riskHistory.at(-1)?.timestamp ?? new Date().toISOString(),
+        startedAt: this.startedAt,
+        thumbnailBase64: this.latestThumbnail,
+        examId: this.examId,
+        recentViolations: this.session.violations.slice(-10),
+      };
+
+      const body: HubInternalUpdate = { summary, alert };
+
+      // Get the hub DO stub for this examId
+      const hubId = this.env.EXAM_HUB.idFromName(this.examId);
+      const hubStub = this.env.EXAM_HUB.get(hubId);
+
+      // Build an internal URL for the hub (/session-event)
+      const hubUrl = new URL(`https://hub.internal/session-event`);
+      await hubStub.fetch(new Request(hubUrl.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }));
+    } catch (err) {
+      // Never block the student's flow
+      console.warn('[ExamSessionDO] Hub report failed (non-fatal):', err);
+    }
   }
 
   // ─── Workers AI integration ───────────────────────────────────────────────
