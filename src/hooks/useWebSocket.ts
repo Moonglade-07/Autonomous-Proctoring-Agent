@@ -11,7 +11,7 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { BehavioralEventType, ClipboardPayload, WSOutboundMsg } from '../types';
+import type { BehavioralEventType, ClipboardPayload, VisionEventPayload, WSOutboundMsg } from '../types';
 
 type WSStatus = 'connecting' | 'open' | 'closed' | 'error';
 
@@ -81,9 +81,9 @@ export function useWebSocket({ sessionId, onMessage }: UseWebSocketOptions) {
    * Optionally includes a payload (e.g., clipboard action details).
    */
   const sendEvent = useCallback(
-    (eventType: BehavioralEventType, payload?: ClipboardPayload) => {
+    (eventType: BehavioralEventType, payload?: ClipboardPayload | VisionEventPayload) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        const msg: { eventType: BehavioralEventType; payload?: ClipboardPayload } = { eventType };
+        const msg: { eventType: BehavioralEventType; payload?: ClipboardPayload | VisionEventPayload } = { eventType };
         if (payload) msg.payload = payload;
         wsRef.current.send(JSON.stringify(msg));
       } else {

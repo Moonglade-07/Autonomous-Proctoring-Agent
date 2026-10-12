@@ -79,15 +79,18 @@ function assessQuality(
       const eyeToNoseDist = noseTip.y - eyeCenterY;
       const pitchRatio = eyeToChinDist > 10 ? eyeToNoseDist / eyeToChinDist : 0;
 
+      // Relaxed thresholds: generous ranges for normal seating & camera angles
+      if (Math.abs(yawRatio) > 0.45) {
+        return { level: 'poor', hint: 'Look straight at the camera' };
+      }
+      if (pitchRatio > 0.85 || pitchRatio < 0.15) {
+        return { level: 'poor', hint: 'Look straight at the camera' };
+      }
       if (Math.abs(yawRatio) > 0.35) {
-        return { level: 'poor', hint: 'Look straight at the camera' };
-      }
-      if (pitchRatio > 0.7 || pitchRatio < 0.3) {
-        return { level: 'poor', hint: 'Look straight at the camera' };
-      }
-      // Borderline yaw (relaxed from 0.18)
-      if (Math.abs(yawRatio) > 0.25) {
         return { level: 'borderline', hint: 'Almost — face the camera a bit more' };
+      }
+      if (pitchRatio > 0.78 || pitchRatio < 0.22) {
+        return { level: 'borderline', hint: 'Tilt your head slightly toward the camera' };
       }
     }
   }
@@ -104,24 +107,26 @@ function assessQuality(
   const offX = Math.abs(visibleCX - 0.5);
   const offY = Math.abs(faceCY - 0.5);
 
-  if (offX > 0.15 || offY > 0.15) {
+  // Relaxed centering tolerance:
+  // ±15% horizontal (35%-65% width) and ±18% vertical (32%-68% height) is GREEN
+  if (offX > 0.22 || offY > 0.25) {
     return { level: 'poor', hint: 'Center your face in the oval' };
   }
-  if (offX > 0.08 || offY > 0.08) {
+  if (offX > 0.15 || offY > 0.18) {
     return { level: 'borderline', hint: 'Almost centered — adjust slightly' };
   }
 
   // Size check — using face height relative to video height
-  // The oval is 65% of container height. We want the face to fill a good portion of it.
+  // Relaxed size range: normal seating distance from webcam (22% to 85% of frame) is GREEN
   const faceToVideoHeightRatio = box.height / videoH;
 
-  if (faceToVideoHeightRatio < 0.30) {
+  if (faceToVideoHeightRatio < 0.18) {
     return { level: 'poor', hint: 'Move closer to the camera' };
   }
-  if (faceToVideoHeightRatio > 0.75) {
+  if (faceToVideoHeightRatio > 0.85) {
     return { level: 'poor', hint: 'Move further from the camera' };
   }
-  if (faceToVideoHeightRatio < 0.40) {
+  if (faceToVideoHeightRatio < 0.24) {
     return { level: 'borderline', hint: 'A little closer would be better' };
   }
 
@@ -149,7 +154,7 @@ export function IdentityCaptureModal({ onCapture, onConfirm, onCancel, videoRef 
 
     try {
       const detection = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 }))
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.35 }))
         .withFaceLandmarks(true); // tiny landmarks — fast
 
       const q = assessQuality(
@@ -365,16 +370,22 @@ export function IdentityCaptureModal({ onCapture, onConfirm, onCancel, videoRef 
                 </button>
                 <button
                   onClick={handleCapture}
-                  disabled={quality.level !== 'good' || step === 'capturing'}
+                  disabled={quality.level === 'none' || quality.level === 'poor' || step === 'capturing'}
                   className={`
                     flex-1 px-4 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer active:scale-[0.98]
                     ${quality.level === 'good' && step !== 'capturing'
                       ? 'text-white bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 shadow-lg shadow-cyan-900/30'
+                      : quality.level === 'borderline' && step !== 'capturing'
+                      ? 'text-amber-200 bg-amber-600/70 hover:bg-amber-500/80 border border-amber-500/40 shadow-lg shadow-amber-900/20'
                       : 'text-gray-500 bg-gray-800 border border-gray-700 cursor-not-allowed opacity-60'
                     }
                   `}
                 >
-                  {step === 'capturing' ? 'Analyzing…' : '📸 Capture Face'}
+                  {step === 'capturing'
+                    ? 'Analyzing…'
+                    : quality.level === 'borderline'
+                    ? '📸 Capture Anyway'
+                    : '📸 Capture Face'}
                 </button>
               </div>
             </div>

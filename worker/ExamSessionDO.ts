@@ -53,8 +53,11 @@ function uid(): string {
  */
 const RISK_DELTAS: Record<string, number> = {
   tab_switch:           15,
-  face_not_detected:    20,
+  face_not_detected:    20, // legacy
+  no_face:              20,
   multiple_faces:       25,
+  orientation_away:     15,
+  identity_mismatch:    40,
   normal:               -5,
   clipboard_activity:   18,
   fullscreen_exit:      15,
@@ -64,8 +67,11 @@ const RISK_DELTAS: Record<string, number> = {
 /** Maps each event type to the corresponding Violation category. */
 const VIOLATION_TYPE_MAP: Record<string, Violation['type']> = {
   tab_switch:          'behavioral',
-  face_not_detected:   'vision',
+  face_not_detected:   'vision', // legacy
+  no_face:             'vision',
   multiple_faces:      'vision',
+  orientation_away:    'vision',
+  identity_mismatch:   'vision',
   normal:              'system',
   clipboard_activity:  'behavioral',
   fullscreen_exit:     'behavioral',
@@ -250,12 +256,40 @@ export class ExamSessionDO implements DurableObject {
     const delta = RISK_DELTAS[eventType] ?? 0;
     const rawNewScore = Math.min(100, Math.max(0, this.session.riskScore + delta));
 
-    // Step 2: AI-powered risk assessment via Llama 3.3-70B
-    // Include payload context (e.g., clipboard action) in the AI prompt
-    const payloadContext = payload
-      ? ` (details: ${JSON.stringify(payload)})`
-      : '';
-    const aiResult = await this.callWorkersAI(eventType + payloadContext, rawNewScore);
+    // Step 2: Vision Model processing (if frame is provided)
+    let visionDescription = '';
+    let durationContext = '';
+    
+    if (payload && 'frameBase64' in payload && payload.frameBase64) {
+      try {
+        const base64Data = payload.frameBase64.replace(/^data:image\/\w+;base64,/, '');
+        const buffer = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
+        
+        const visionResponse = await withTimeout(
+          this.env.AI.run('@cf/llava-hf/llava-1.5-7b-hf', {
+            prompt: "Analyze this image for an exam proctoring system. Describe how many faces are visible, their approximate orientation, and anything else notable (e.g., objects like phones, books, notes visible). Keep it concise.",
+            image: [...buffer],
+          }),
+          25_000
+        );
+        visionDescription = (visionResponse as any).description || (visionResponse as any).response || JSON.stringify(visionResponse);
+      } catch (err) {
+        console.error('[ExamSessionDO] Vision model failed:', err);
+        visionDescription = '(Vision analysis unavailable)';
+      }
+    }
+
+    if (payload && 'durationSeconds' in payload) {
+      durationContext = ` (duration: ${payload.durationSeconds}s, client flag: ${payload.clientDetection})`;
+    }
+
+    // Step 3: AI-powered risk assessment via Llama 3.3-70B
+    // Include payload context and vision context in the AI prompt
+    let payloadContext = payload ? ` (details: ${JSON.stringify(payload)})` : '';
+    if (durationContext || visionDescription) {
+       payloadContext = durationContext + (visionDescription ? `\nVision AI analysis of the scene: "${visionDescription.trim()}"` : '');
+    }
+    const aiResult = await this.callWorkersAI(eventType + payloadContext, this.session.riskScore, rawNewScore);
 
     // Step 3: Build the risk event record
     const now = new Date().toISOString();
@@ -322,6 +356,7 @@ export class ExamSessionDO implements DurableObject {
    */
   private async callWorkersAI(
     eventType: string,
+    previousScore: number,
     rawScore: number
   ): Promise<{ score: number; explanation: string; confidence: number }> {
     const recentHistory = this.session.riskHistory
@@ -334,13 +369,18 @@ Your job is to assess academic integrity violations in real-time.
 You MUST respond with valid JSON only — no markdown, no explanation outside JSON.
 JSON schema: { "score": <integer 0-100>, "explanation": "<one sentence>", "confidence": <float 0-1> }`;
 
-    const userPrompt = `Current exam session risk score: ${rawScore}/100
+    const userPrompt = `Previous cumulative risk score (before this event): ${previousScore}/100
+Naively updated score (with this event): ${rawScore}/100
 New behavioral event detected: "${eventType}"
 
 Recent history (last 5 events):
 ${recentHistory || '  (none yet)'}
 
-Assess the risk. Return an updated score (0-100), a brief warning or reassurance for the student/proctor, and your confidence (0-1).
+Assess the risk based on the event and its duration. If a Vision AI analysis is provided, compare it against the client flag. 
+If the Vision AI contradicts the client flag (e.g., client flagged 'multiple faces' but Vision AI sees 1 face), it's a false positive! In this case, REVERT the score to the \`Previous cumulative risk score\` (${previousScore}). DO NOT reset the overall score to 0 unless the previous score was 0.
+If it is a true positive, use the \`Naively updated score\` (${rawScore}) as a baseline, and adjust it up or down based on duration and severity.
+The score is cumulative over the whole session. Never drop the score drastically just because one event is a false positive.
+Return an updated cumulative score (0-100), a brief explanation, and your confidence (0-1).
 Only respond with the JSON object.`;
 
     try {
@@ -400,7 +440,10 @@ Only respond with the JSON object.`;
     const map: Record<string, string> = {
       tab_switch:          'Tab switch detected — this may indicate accessing external resources.',
       face_not_detected:   'Face not detected in camera — please ensure you remain visible.',
+      no_face:             'Face not detected in camera — please ensure you remain visible.',
       multiple_faces:      'Multiple faces detected — only the exam taker should be present.',
+      orientation_away:    'Head turned away from screen — please look forward.',
+      identity_mismatch:   'Identity verification mismatch — unauthorized person detected.',
       normal:              'Behavior appears normal. No violations detected.',
       clipboard_activity:  'Clipboard activity detected — copy/paste operations are monitored during exams.',
       fullscreen_exit:     'Fullscreen mode exited — exam requires fullscreen mode to be active.',

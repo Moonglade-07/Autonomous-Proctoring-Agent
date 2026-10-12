@@ -32,8 +32,11 @@ function severityBadge(score: number): { label: string; cls: string } {
 function triggerIcon(trigger: string): string {
   const icons: Record<string, string> = {
     tab_switch: '🔀',
-    face_not_detected: '👤',
+    face_not_detected: '👤', // legacy
+    no_face: '👤',
     multiple_faces: '👥',
+    orientation_away: '👀',
+    identity_mismatch: '🕵️',
     normal: '✅',
     clipboard_activity: '📋',
     fullscreen_exit: '🖥️',
@@ -47,7 +50,10 @@ function triggerLabel(trigger: string): string {
   const labels: Record<string, string> = {
     tab_switch: 'Tab Switch',
     face_not_detected: 'Face Not Detected',
+    no_face: 'Face Not Detected',
     multiple_faces: 'Multiple Faces',
+    orientation_away: 'Looking Away',
+    identity_mismatch: 'Identity Mismatch',
     normal: 'Normal Behavior',
     clipboard_activity: 'Clipboard Activity',
     fullscreen_exit: 'Fullscreen Exit',
@@ -135,16 +141,23 @@ export function EventLog({ events, onClear }: EventLogProps) {
 
         {/* Event entries */}
         {reversed.map((event, idx) => {
-          const badge = severityBadge(event.score);
+          const isFalsePositive = event.aiExplanation.toLowerCase().includes('false positive');
+          const badge = isFalsePositive
+            ? { label: 'DISMISSED (NO PENALTY)', cls: 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/40' }
+            : severityBadge(event.score);
           const trigger = event.triggers[0] ?? '';
           return (
             <div
               key={`${event.timestamp}-${idx}`}
-              className="flex gap-3 p-3.5 rounded-xl bg-white/[0.04] border border-white/[0.07] hover:bg-white/[0.07] transition-colors duration-200 animate-fade-in group"
+              className={`flex gap-3 p-3.5 rounded-xl border transition-colors duration-200 animate-fade-in group ${
+                isFalsePositive
+                  ? 'bg-emerald-950/20 border-emerald-500/20 hover:bg-emerald-950/30'
+                  : 'bg-white/[0.04] border-white/[0.07] hover:bg-white/[0.07]'
+              }`}
             >
               {/* Trigger icon */}
               <div className="flex-shrink-0 text-xl leading-none mt-0.5 select-none" aria-hidden>
-                {triggerIcon(trigger)}
+                {isFalsePositive ? '🛡️' : triggerIcon(trigger)}
               </div>
 
               {/* Content */}
@@ -154,12 +167,13 @@ export function EventLog({ events, onClear }: EventLogProps) {
                   <span className="text-xs font-semibold text-gray-200">
                     {triggerLabel(trigger)}
                   </span>
-                  <span className={`text-xs font-bold px-1.5 py-0.5 rounded-md ${badge.cls}`}>
+                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-md ${badge.cls}`}>
                     {badge.label}
                   </span>
-                  <span className="text-xs text-gray-600 font-mono ml-auto">
+                  <span className="text-xs text-gray-500 font-mono ml-auto">
                     score&nbsp;
-                    <span className="text-gray-400 font-semibold">{event.score}</span>
+                    <span className="text-gray-300 font-semibold">{event.score}</span>
+                    {isFalsePositive && <span className="text-[10px] text-emerald-400/80 ml-1">(protected)</span>}
                   </span>
                 </div>
 

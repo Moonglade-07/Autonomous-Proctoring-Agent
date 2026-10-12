@@ -3,11 +3,10 @@
  * ─────────────────────────────────────────────────────────────────
  * Main exam interface — Phase 2c of the Autonomous Proctoring Agent.
  *
- * Phase 2c additions:
- *   • Identity capture modal before exam starts
- *   • Reference face thumbnail display in monitoring panel
- *   • Identity verification status signal (Verified / Mismatch)
- *   • identity_mismatch flag in Pending Review banner
+ * Phase 2d additions:
+ *   • Live vision flags sent to backend (no_face, multiple_faces, etc.)
+ *   • Vision model (Llava) confirmation
+ *   • Llama 3.3 multimodal risk reasoning
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -159,6 +158,7 @@ export function ExamPage() {
   const { faceState, activeFlags, referenceCapture, captureReference } = useFaceDetection({
     videoRef,
     monitoringActive: monitoringState.active,
+    sendEvent,
   });
 
   // ── Exam Start Flow (Phase 2c: identity capture → behavioral monitoring) ──
@@ -363,10 +363,10 @@ export function ExamPage() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-5 pb-1">
         <div className="rounded-2xl bg-gradient-to-r from-violet-950/60 via-indigo-950/50 to-blue-950/40 border border-violet-700/20 px-5 py-4">
           <p className="text-sm text-gray-300 leading-relaxed">
-            <span className="font-semibold text-white">Phase 2c — Identity Verification — </span>
-            A reference face is captured at exam start and continuously compared against the live feed.
-            Identity mismatches are tracked locally. Face detection, orientation, and behavioral signals
-            all run in parallel.
+            <span className="font-semibold text-white">Phase 2d — Multimodal AI Proctoring — </span>
+            A reference face is captured at exam start. Live vision detection flags (like no face or multiple faces) 
+            are sent to the backend where a vision model (Llava) verifies the snapshot, before Llama 3.3 reasons 
+            about the risk score based on both behavioral and visual inputs.
           </p>
         </div>
       </div>
@@ -589,7 +589,7 @@ export function ExamPage() {
       {/* ── Footer ──────────────────────────────────────────────────────────── */}
       <footer className="border-t border-white/[0.07] mt-4 py-4 px-4 sm:px-6">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-gray-700">
-          <span>Autonomous Proctoring Agent · Phase 2c</span>
+          <span>Autonomous Proctoring Agent · Phase 2d</span>
           <span>Powered by Cloudflare Workers AI · Durable Objects · WebSockets</span>
         </div>
       </footer>

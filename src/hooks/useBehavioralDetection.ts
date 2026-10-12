@@ -23,7 +23,7 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
-import type { BehavioralEventType, ClipboardPayload } from '../types';
+import type { BehavioralEventType, ClipboardPayload, VisionEventPayload } from '../types';
 
 /** Minimum interval between same-type events (ms) */
 const DEBOUNCE_MS = 1000;
@@ -44,7 +44,7 @@ export interface MonitoringState {
 
 interface UseBehavioralDetectionOptions {
   /** Function to send events over WebSocket — from useWebSocket hook */
-  sendEvent: (type: BehavioralEventType, payload?: ClipboardPayload) => void;
+  sendEvent: (type: BehavioralEventType, payload?: ClipboardPayload | VisionEventPayload) => void;
   /** Current WebSocket connection status */
   wsStatus: string;
 }

@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState, useCallback, type RefObject } from 'react';
 import * as faceapi from 'face-api.js';
+import type { BehavioralEventType, ClipboardPayload, VisionEventPayload } from '../types';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -71,7 +72,7 @@ export interface ReferenceCapture {
 
 function estimateOrientation(landmarks: faceapi.FaceLandmarks68): HeadOrientation {
   const positions = landmarks.positions;
-  if (positions.length < 68) return 'unknown';
+  if (!positions || positions.length < 68) return 'unknown';
 
   const noseTip = positions[30];
   const leftEyeInner = positions[39];
@@ -79,6 +80,8 @@ function estimateOrientation(landmarks: faceapi.FaceLandmarks68): HeadOrientatio
   const leftEyeOuter = positions[36];
   const rightEyeOuter = positions[45];
   const chin = positions[8];
+  const jawLeft = positions[0];
+  const jawRight = positions[16];
 
   const eyeCenterX = (leftEyeInner.x + rightEyeInner.x) / 2;
   const eyeCenterY = (leftEyeInner.y + rightEyeInner.y) / 2;
@@ -86,15 +89,41 @@ function estimateOrientation(landmarks: faceapi.FaceLandmarks68): HeadOrientatio
   const faceWidth = Math.abs(rightEyeOuter.x - leftEyeOuter.x);
   if (faceWidth < 10) return 'unknown';
 
+  // Primary yaw metric: nose displacement relative to eye center normalized by face width
   const yawRatio = (noseTip.x - eyeCenterX) / faceWidth;
+
+  // Secondary yaw metrics: asymmetry between nose-to-left vs nose-to-right eye & jaw
+  // (Invaluable when head is turned sideways/profile and occluded eye landmarks compress)
+  const distLeftEye = Math.abs(noseTip.x - leftEyeInner.x);
+  const distRightEye = Math.abs(noseTip.x - rightEyeInner.x);
+  const eyeAsymmetry = (distLeftEye + distRightEye) > 5
+    ? (distRightEye - distLeftEye) / (distRightEye + distLeftEye)
+    : 0;
+
+  const distLeftJaw = Math.abs(noseTip.x - jawLeft.x);
+  const distRightJaw = Math.abs(jawRight.x - noseTip.x);
+  const jawAsymmetry = (distLeftJaw + distRightJaw) > 10
+    ? (distRightJaw - distLeftJaw) / (distRightJaw + distLeftJaw)
+    : 0;
+
+  // Pitch calculation
   const eyeToChinDist = chin.y - eyeCenterY;
   const eyeToNoseDist = noseTip.y - eyeCenterY;
   const pitchRatio = eyeToChinDist > 10 ? eyeToNoseDist / eyeToChinDist : 0;
 
-  if (yawRatio < -0.25) return 'right';
-  if (yawRatio > 0.25) return 'left';
-  if (pitchRatio > 0.65) return 'down';
-  if (pitchRatio < 0.35) return 'up';
+  // Unmirrored video coordinate frame:
+  // Turning to user's RIGHT shifts nose towards image LEFT (negative yawRatio, positive eyeAsymmetry)
+  if (yawRatio < -0.22 || (yawRatio < -0.15 && (eyeAsymmetry > 0.30 || jawAsymmetry > 0.35))) {
+    return 'right';
+  }
+  // Turning to user's LEFT shifts nose towards image RIGHT (positive yawRatio, negative eyeAsymmetry)
+  if (yawRatio > 0.22 || (yawRatio > 0.15 && (eyeAsymmetry < -0.30 || jawAsymmetry < -0.35))) {
+    return 'left';
+  }
+
+  // Pitch: looking down at phone/lap vs looking up at ceiling
+  if (pitchRatio > 0.80) return 'down';
+  if (pitchRatio < 0.18) return 'up';
 
   return 'forward';
 }
@@ -116,9 +145,10 @@ function captureVideoThumbnail(video: HTMLVideoElement, size = 120): string {
 interface UseFaceDetectionOptions {
   videoRef: RefObject<HTMLVideoElement | null>;
   monitoringActive: boolean;
+  sendEvent?: (type: BehavioralEventType, payload?: ClipboardPayload | VisionEventPayload) => void;
 }
 
-export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectionOptions) {
+export function useFaceDetection({ videoRef, monitoringActive, sendEvent }: UseFaceDetectionOptions) {
   const [state, setState] = useState<FaceDetectionState>({
     modelState: 'idle',
     faceCount: 0,
@@ -144,6 +174,18 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
   const identityLoopRef = useRef<number | null>(null);
   const activeRef = useRef(false);
   const referenceDescriptorRef = useRef<Float32Array | null>(null);
+  const lastSentRef = useRef<Record<string, number>>({});
+  const evidenceFrameRef = useRef<Record<string, string>>({});
+
+  const captureEvidence = useCallback((type: ActiveFlag['type']) => {
+    if (videoRef.current && videoRef.current.readyState >= 2) {
+      try {
+        evidenceFrameRef.current[type] = captureVideoThumbnail(videoRef.current, 640);
+      } catch (e) {
+        console.error('[FaceDetection] Failed to capture evidence frame', e);
+      }
+    }
+  }, [videoRef]);
 
   // ─── Load models ──────────────────────────────────────────────────────────
 
@@ -184,8 +226,9 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
 
     try {
       // Use the full pipeline: detect → full landmarks → descriptor
+      // Match the visual quality checker threshold (0.35)
       const detection = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 }))
+        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.35 }))
         .withFaceLandmarks(false) // false = use FULL 68-point model (required for descriptor)
         .withFaceDescriptor();
 
@@ -232,10 +275,39 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
           eventStr += `_${existing.orientation}`;
         }
         console.log(`[FaceDetection] FINALIZED EVENT: ${eventStr}, duration: ${(existing.durationMs / 1000).toFixed(1)}s`);
+
+        if (sendEvent) {
+          const now = Date.now();
+          lastSentRef.current[type] = now;
+
+          // CRITICAL FIX: Use the evidence frame captured DURING the violation!
+          // (If we capture now from videoRef, the user has already returned / turned back!)
+          const frameBase64 = evidenceFrameRef.current[type] ||
+            (videoRef.current && videoRef.current.readyState >= 2
+              ? captureVideoThumbnail(videoRef.current, 640)
+              : undefined);
+
+          // Clean up stored evidence frame
+          delete evidenceFrameRef.current[type];
+
+          let backendType: BehavioralEventType = 'normal';
+          if (type === 'no_face') backendType = 'no_face';
+          else if (type === 'multiple_faces') backendType = 'multiple_faces';
+          else if (type === 'head_turned') backendType = 'orientation_away';
+          else if (type === 'identity_mismatch') backendType = 'identity_mismatch';
+
+          if (backendType !== 'normal') {
+            sendEvent(backendType, {
+              durationSeconds: parseFloat((existing.durationMs / 1000).toFixed(1)),
+              frameBase64,
+              clientDetection: eventStr,
+            } as VisionEventPayload);
+          }
+        }
       }
       return prev.filter((f) => f.type !== type);
     });
-  }, []);
+  }, [sendEvent, videoRef]);
 
   // ─── Single detection pass (face count + orientation) ─────────────────────
 
@@ -265,6 +337,9 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
       const tr = trackersRef.current;
 
       const updateFlag = (type: ActiveFlag['type'], startedAt: number, elapsed: number, orient?: HeadOrientation) => {
+        // Capture evidence frame during the active violation!
+        captureEvidence(type);
+
         setActiveFlags((prev) => {
           const next = [...prev];
           const idx = next.findIndex((f) => f.type === type);
@@ -283,6 +358,17 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
         const elapsed = now - tr.noFace;
         if (elapsed >= NO_FACE_THRESHOLD_MS) {
           updateFlag('no_face', tr.noFace, elapsed);
+
+          // Prolonged absence alert: if student is away for >= 8s and cooldown passed,
+          // notify backend immediately so they cannot abandon the desk undetected!
+          if (sendEvent && elapsed >= 8000 && (now - (lastSentRef.current['no_face'] || 0)) >= 10000) {
+            lastSentRef.current['no_face'] = now;
+            sendEvent('no_face', {
+              durationSeconds: parseFloat((elapsed / 1000).toFixed(1)),
+              frameBase64: evidenceFrameRef.current['no_face'],
+              clientDetection: `no_face_ongoing_${(elapsed / 1000).toFixed(0)}s`,
+            } as VisionEventPayload);
+          }
         }
       } else {
         if (tr.noFace !== null) {
@@ -375,6 +461,7 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
         if (tr.identityMismatch === null) tr.identityMismatch = now;
         const elapsed = now - tr.identityMismatch;
         if (elapsed >= IDENTITY_MISMATCH_THRESHOLD_MS) {
+          captureEvidence('identity_mismatch');
           console.warn(`[FaceDetection] Identity mismatch: distance=${distance.toFixed(3)}, elapsed=${elapsed}ms`);
           setActiveFlags((prev) => {
             const next = [...prev];
@@ -386,6 +473,16 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
             }
             return next;
           });
+
+          // Prolonged mismatch alert: if substitute persists for >= 8s
+          if (sendEvent && elapsed >= 8000 && (now - (lastSentRef.current['identity_mismatch'] || 0)) >= 10000) {
+            lastSentRef.current['identity_mismatch'] = now;
+            sendEvent('identity_mismatch', {
+              durationSeconds: parseFloat((elapsed / 1000).toFixed(1)),
+              frameBase64: evidenceFrameRef.current['identity_mismatch'],
+              clientDetection: `identity_mismatch_ongoing_${(elapsed / 1000).toFixed(0)}s`,
+            } as VisionEventPayload);
+          }
         }
       } else {
         if (tr.identityMismatch !== null) {
@@ -448,6 +545,21 @@ export function useFaceDetection({ videoRef, monitoringActive }: UseFaceDetectio
           let eventStr: string = f.type;
           if (f.type === 'head_turned' && f.orientation) eventStr += `_${f.orientation}`;
           console.log(`[FaceDetection] FINALIZED EVENT (exam ended): ${eventStr}, duration: ${(f.durationMs / 1000).toFixed(1)}s`);
+          
+          if (sendEvent) {
+            let backendType: BehavioralEventType = 'normal';
+            if (f.type === 'no_face') backendType = 'no_face';
+            else if (f.type === 'multiple_faces') backendType = 'multiple_faces';
+            else if (f.type === 'head_turned') backendType = 'orientation_away';
+            else if (f.type === 'identity_mismatch') backendType = 'identity_mismatch';
+
+            if (backendType !== 'normal') {
+              sendEvent(backendType, {
+                durationSeconds: parseFloat((f.durationMs / 1000).toFixed(1)),
+                clientDetection: eventStr,
+              } as VisionEventPayload);
+            }
+          }
         });
         return [];
       });

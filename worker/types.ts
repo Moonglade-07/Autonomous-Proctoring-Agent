@@ -7,16 +7,24 @@
 /** All event types the proctoring system can detect and process. */
 export type BehavioralEventType =
   | 'tab_switch'
-  | 'face_not_detected'
-  | 'multiple_faces'
-  | 'normal'
   | 'clipboard_activity'
   | 'fullscreen_exit'
-  | 'right_click_attempt';
+  | 'right_click_attempt'
+  | 'no_face'
+  | 'multiple_faces'
+  | 'orientation_away'
+  | 'identity_mismatch'
+  | 'normal';
 
 /** Payload sent alongside clipboard_activity events. */
 export interface ClipboardPayload {
   action: 'copy' | 'paste';
+}
+
+export interface VisionEventPayload {
+  durationSeconds: number;
+  frameBase64?: string;
+  clientDetection: string; // what the client-side model flagged
 }
 
 // ─── Data Models ─────────────────────────────────────────────────────────────
@@ -50,7 +58,7 @@ export interface ExamSessionState {
 /** Messages sent FROM frontend TO backend DO */
 export interface BehavioralEventMsg {
   eventType: BehavioralEventType;
-  payload?: ClipboardPayload;
+  payload?: ClipboardPayload | VisionEventPayload;
 }
 
 /** Messages sent FROM backend DO TO frontend */
