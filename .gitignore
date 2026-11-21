@@ -29,3 +29,10 @@ dist-ssr
 !.dev.vars.example
 .env*
 !.env.example
+
+# Database backups
+backup*.sql
+
+# Scratch scripts and files
+scratch/
+

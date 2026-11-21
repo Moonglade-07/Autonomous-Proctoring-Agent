@@ -5,26 +5,54 @@
  * persistent WebSocket connection to ExamHubDO at /api/hub/:examId.
  *
  * Returns:
- *   • sessions  — Record<sessionId, SessionSummary> (live)
- *   • alerts    — HubAlert[] (last 100, newest first)
- *   • status    — connection status badge
+ *   • sessions        — Record<sessionId, SessionSummary> (live)
+ *   • alerts          — HubAlert[] (last 100, newest first)
+ *   • status          — connection status badge
+ *   • sendCommand     — Phase 3b: issue a command to a student session
+ *   • commandResults  — Phase 3b: recent command delivery results/acks
  * ─────────────────────────────────────────────────────────────────
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { SessionSummary, HubAlert, HubOutboundMsg } from '../types';
+import type {
+  SessionSummary,
+  HubAlert,
+  HubOutboundMsg,
+  InterventionAction,
+  Intervention,
+} from '../types';
 
 type WSStatus = 'connecting' | 'open' | 'closed' | 'error';
 
-interface UseHubSocketOptions {
-  examId: string;
+/** Result of a professor command (delivery acknowledgement). */
+export interface CommandResult {
+  sessionId: string;
+  action: InterventionAction;
+  status: 'delivered' | 'queued' | 'error' | 'noop';
+  message: string;
+  timestamp: string;
 }
 
-export function useHubSocket({ examId }: UseHubSocketOptions) {
+/** Acknowledgement received from a student back to the professor. */
+export interface CommandAckRecord {
+  interventionId: string;
+  sessionId: string;
+  action: InterventionAction;
+  acknowledgedAt: string;
+}
+
+interface UseHubSocketOptions {
+  examId: string;
+  professorKey?: string;
+}
+
+export function useHubSocket({ examId, professorKey }: UseHubSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<WSStatus>('connecting');
   const [sessions, setSessions] = useState<Record<string, SessionSummary>>({});
   const [alerts, setAlerts] = useState<HubAlert[]>([]);
+  const [commandResults, setCommandResults] = useState<CommandResult[]>([]);
+  const [commandAcks, setCommandAcks] = useState<CommandAckRecord[]>([]);
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
 
@@ -32,7 +60,8 @@ export function useHubSocket({ examId }: UseHubSocketOptions) {
     if (!mountedRef.current) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/hub/${encodeURIComponent(examId)}`;
+    const keyQuery = professorKey ? `?key=${encodeURIComponent(professorKey)}` : '';
+    const wsUrl = `${protocol}//${window.location.host}/api/hub/${encodeURIComponent(examId)}${keyQuery}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -61,6 +90,40 @@ export function useHubSocket({ examId }: UseHubSocketOptions) {
           });
         } else if (msg.type === 'alert') {
           setAlerts((prev) => [msg.alert, ...prev].slice(0, 100));
+        } else if (msg.type === 'command_result') {
+          // Phase 3b: store command delivery result
+          const result: CommandResult = {
+            sessionId: msg.sessionId,
+            action: msg.action,
+            status: msg.status,
+            message: msg.message,
+            timestamp: new Date().toISOString(),
+          };
+          setCommandResults((prev) => [result, ...prev].slice(0, 50));
+        } else if (msg.type === 'command_ack') {
+          // Phase 3b: student acknowledged a command
+          const ack: CommandAckRecord = {
+            interventionId: msg.interventionId,
+            sessionId: msg.sessionId,
+            action: msg.action,
+            acknowledgedAt: msg.acknowledgedAt,
+          };
+          setCommandAcks((prev) => [ack, ...prev].slice(0, 50));
+          // Also update interventions on the session summary
+          setSessions((prev) => {
+            const session = prev[msg.sessionId];
+            if (!session) return prev;
+            const updatedInterventions = (session.interventions ?? []).map(
+              (inv: Intervention) =>
+                inv.id === msg.interventionId
+                  ? { ...inv, acknowledgedAt: msg.acknowledgedAt }
+                  : inv
+            );
+            return {
+              ...prev,
+              [msg.sessionId]: { ...session, interventions: updatedInterventions },
+            };
+          });
         }
       } catch {
         console.error('[useHubSocket] Failed to parse message', evt.data);
@@ -79,7 +142,7 @@ export function useHubSocket({ examId }: UseHubSocketOptions) {
         }, 3000);
       }
     };
-  }, [examId]);
+  }, [examId, professorKey]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -91,5 +154,33 @@ export function useHubSocket({ examId }: UseHubSocketOptions) {
     };
   }, [connect]);
 
-  return { sessions, alerts, status };
+  /**
+   * Phase 3b: Issue a professor command to a student session.
+   * Sends a 'command' message over the hub WebSocket, including the professor key.
+   *
+   * @param sessionId - Target student session
+   * @param action    - 'warn' | 'pause' | 'resume' | 'force_submit'
+   * @param message   - Optional custom message (for warnings)
+   */
+  const sendCommand = useCallback(
+    (sessionId: string, action: InterventionAction, message?: string) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.warn('[useHubSocket] Cannot send command — WebSocket not open');
+        return;
+      }
+      ws.send(
+        JSON.stringify({
+          type: 'command',
+          sessionId,
+          action,
+          message,
+          key: professorKey ?? '',
+        })
+      );
+    },
+    [professorKey]
+  );
+
+  return { sessions, alerts, status, sendCommand, commandResults, commandAcks };
 }

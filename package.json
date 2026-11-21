@@ -9,13 +9,18 @@
     "lint": "oxlint",
     "preview": "npm run build && vite preview",
     "deploy": "npm run build && wrangler deploy",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply apa-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply apa-db --remote",
+    "db:seed:local": "wrangler d1 execute apa-db --local --file=seed.sql",
+    "test": "vitest run"
   },
   "dependencies": {
     "face-api.js": "^0.22.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "react-router-dom": "^7.18.4"
+    "react-router-dom": "^7.18.4",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.60.2",
@@ -28,6 +33,7 @@
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.2",
     "vite": "^8.3.0",
+    "vitest": "^5.0.5",
     "wrangler": "^4.141.0"
   }
 }

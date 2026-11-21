@@ -105,5 +105,17 @@ export function useWebSocket({ sessionId, examId, studentName, onMessage }: UseW
     []
   );
 
-  return { sendEvent, status };
+  /**
+   * Phase 3b: Send an arbitrary JSON object over the WebSocket.
+   * Used for command_ack messages that don't follow the BehavioralEventMsg schema.
+   */
+  const sendRaw = useCallback((data: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(data));
+    } else {
+      console.warn('[useWebSocket] Cannot sendRaw — WebSocket not open');
+    }
+  }, []);
+
+  return { sendEvent, sendRaw, status };
 }

@@ -14,6 +14,10 @@
  *     4. Updating and persisting session state to Durable Object Storage.
  *     5. Broadcasting the AI result back to all connected WebSocket clients.
  *     6. (Phase 3a) Reporting session summaries and alerts to ExamHubDO.
+ *     7. (Phase 3b) Handling professor commands: warn, pause, resume, force_submit.
+ *        - Commands are persisted as Intervention records and survive reconnects.
+ *        - While paused, behavioral events are recorded but do NOT change riskScore.
+ *        - After force_submit, the session is terminated; further events are ignored.
  *
  * WebSocket API choice:
  *   We use `server.accept()` (non-hibernatable mode) together with `addEventListener`.
@@ -43,11 +47,15 @@ import type {
   HubAlert,
   HubInternalUpdate,
   ThumbnailPayload,
+  Intervention,
+  InterventionAction,
 } from './types.js';
+import { doSubmit } from './api/student.js';
+import { verifyInternalAuth, forbiddenResponse, jsonNotFound } from './utils/internalAuth.js';
 
 // ─── Module-level helpers ────────────────────────────────────────────────────
 
-/** Returns a short random ID (8 hex chars) for violation records. */
+/** Returns a short random ID (8 hex chars) for violation/intervention records. */
 function uid(): string {
   return crypto.randomUUID().slice(0, 8);
 }
@@ -66,7 +74,6 @@ const RISK_DELTAS: Record<string, number> = {
   normal:               -5,
   clipboard_activity:   18,
   fullscreen_exit:      15,
-  right_click_attempt:  8,
 };
 
 /** Maps each event type to the corresponding Violation category. */
@@ -80,7 +87,6 @@ const VIOLATION_TYPE_MAP: Record<string, Violation['type']> = {
   normal:              'system',
   clipboard_activity:  'behavioral',
   fullscreen_exit:     'behavioral',
-  right_click_attempt: 'behavioral',
 };
 
 /**
@@ -112,6 +118,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+// ─── Session status type ─────────────────────────────────────────────────────
+
+type SessionStatus = 'active' | 'paused' | 'terminated' | 'submitted';
+
 // ─── Durable Object class ────────────────────────────────────────────────────
 
 export class ExamSessionDO implements DurableObject {
@@ -126,7 +136,7 @@ export class ExamSessionDO implements DurableObject {
    * Populated from Durable Object Storage on each `fetch()` call via `initialize()`.
    * Written back to storage after every behavioral event.
    */
-  private session: ExamSessionState = {
+  public session: ExamSessionState = {
     sessionId: '',
     riskScore: 0,
     riskHistory: [],
@@ -143,6 +153,17 @@ export class ExamSessionDO implements DurableObject {
 
   /** Phase 3a: latest webcam thumbnail (tiny, forwarded from student). */
   private latestThumbnail: string | undefined;
+
+  // ── Phase 3b: intervention tracking ────────────────────────────────────────
+
+  /** Persisted session status (active | paused | terminated | submitted). */
+  private sessionStatus: SessionStatus = 'active';
+
+  /** Ordered list of all interventions issued against this session. */
+  private interventions: Intervention[] = [];
+
+  /** Queue of commands issued while the student was disconnected. */
+  private pendingCommands: Intervention[] = [];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -163,7 +184,13 @@ export class ExamSessionDO implements DurableObject {
     // Only initialize if session is empty (i.e., first call after construction or eviction)
     if (this.session.sessionId) return;
 
-    const stored = await this.state.storage.get<ExamSessionState>('session');
+    const [stored, storedStatus, storedInterventions, storedPending] = await Promise.all([
+      this.state.storage.get<ExamSessionState>('session'),
+      this.state.storage.get<SessionStatus>('sessionStatus'),
+      this.state.storage.get<Intervention[]>('interventions'),
+      this.state.storage.get<Intervention[]>('pendingCommands'),
+    ]);
+
     if (stored) {
       this.session = stored;
     } else {
@@ -174,6 +201,10 @@ export class ExamSessionDO implements DurableObject {
         violations: [],
       };
     }
+
+    if (storedStatus) this.sessionStatus = storedStatus;
+    if (storedInterventions) this.interventions = storedInterventions;
+    if (storedPending) this.pendingCommands = storedPending;
   }
 
   // ─── Durable Object fetch handler ────────────────────────────────────────
@@ -182,9 +213,9 @@ export class ExamSessionDO implements DurableObject {
    * Entry point for all requests forwarded from the Worker (index.ts).
    *
    * Handles:
-   *   • WebSocket upgrade requests → completes the WebSocket handshake and
-   *     sets up message/close/error listeners.
+   *   • WebSocket upgrade requests → student WebSocket connection.
    *   • GET /history              → returns full riskHistory (for professor detail view).
+   *   • POST /command             → professor intervention command (from ExamHubDO).
    *   • All other requests        → returns 426 Upgrade Required.
    *
    * @param request - The forwarded HTTP request from the Worker.
@@ -194,6 +225,121 @@ export class ExamSessionDO implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const sessionId = url.searchParams.get('sessionId') ?? 'unknown';
+    const isWs = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+
+    // ── WebSocket route (Student Exam Session) ───────────────────────────────
+    if (isWs) {
+      // 4. NO STATE FOR UNKNOWN SESSIONS: check D1 before creating or writing any state
+      if (this.env.DB && sessionId && sessionId !== 'unknown') {
+        const attempt = await this.env.DB.prepare('SELECT id FROM attempts WHERE session_id = ?')
+          .bind(sessionId)
+          .first<{ id: string }>();
+        if (!attempt) {
+          return jsonNotFound();
+        }
+      }
+
+      await this.initialize(sessionId);
+
+      // Phase 3a: read examId and studentName from query params
+      this.examId = url.searchParams.get('examId') ?? 'exam-1';
+      const rawName = url.searchParams.get('name') ?? '';
+      this.studentName = rawName || `Student-${sessionId.slice(0, 6)}`;
+
+      // Create a WebSocket pair: client is returned to the browser,
+      // server stays inside this DO and receives all incoming messages.
+      const { 0: client, 1: server } = new WebSocketPair();
+
+      // IMPORTANT: Use server.accept() (non-hibernatable mode) + addEventListener.
+      // Do NOT use state.acceptWebSocket() here — that API uses the Hibernatable WS
+      // protocol which requires webSocketMessage() class methods, not addEventListener.
+      // Mixing the two APIs silently drops all incoming messages.
+      server.accept();
+      this.sockets.add(server);
+
+      server.addEventListener('message', (evt) => {
+        this.handleMessage(server, evt).catch((err) => {
+          console.error('[ExamSessionDO] Unhandled error in handleMessage:', err);
+          this.send(server, { type: 'error', message: String(err) });
+        });
+      });
+
+      server.addEventListener('close', () => {
+        this.sockets.delete(server);
+        // Phase 3a: notify hub that student disconnected
+        // Phase 3b: keep paused/terminated status even when disconnected
+        const hubStatus = this.sessionStatus === 'terminated' ? 'terminated'
+          : this.sessionStatus === 'submitted' ? 'submitted'
+          : this.sessionStatus === 'paused' ? 'paused'
+          : 'disconnected';
+        this.reportToHub(undefined, hubStatus as SessionSummary['status']).catch(() => {});
+      });
+
+      server.addEventListener('error', (err) => {
+        console.error('[ExamSessionDO] WebSocket error event:', err);
+        this.sockets.delete(server);
+      });
+
+      // Send the full session snapshot to the newly connected client so it can
+      // hydrate its React state without waiting for the first event.
+      this.send(server, {
+        type: 'session_snapshot',
+        session: {
+          ...this.session,
+          sessionStatus: this.sessionStatus,
+        },
+      } satisfies WSOutboundMsg);
+
+      // Phase 3b: If the session was already paused or terminated, re-push the command
+      // so that client refreshes/reconnects immediately re-enter the paused or terminated screen.
+      if (this.sessionStatus === 'paused') {
+        const lastPause = [...this.interventions].reverse().find((i) => i.action === 'pause');
+        this.send(server, {
+          type: 'command',
+          intervention: lastPause ?? {
+            id: 'persisted-pause',
+            action: 'pause',
+            message: 'Your exam has been paused by the proctor.',
+            issuedAt: new Date().toISOString(),
+          },
+        } satisfies WSOutboundMsg);
+      } else if (this.sessionStatus === 'terminated') {
+        const lastTerm = [...this.interventions].reverse().find((i) => i.action === 'force_submit');
+        this.send(server, {
+          type: 'command',
+          intervention: lastTerm ?? {
+            id: 'persisted-terminated',
+            action: 'force_submit',
+            message: 'Your exam has been ended by the proctor.',
+            issuedAt: new Date().toISOString(),
+          },
+        } satisfies WSOutboundMsg);
+      }
+
+      // Phase 3b: deliver any pending commands that accumulated while student was offline
+      if (this.pendingCommands.length > 0) {
+        for (const intervention of this.pendingCommands) {
+          this.send(server, { type: 'command', intervention } satisfies WSOutboundMsg);
+        }
+        // Commands delivered — clear queue
+        this.pendingCommands = [];
+        await this.state.storage.put('pendingCommands', []);
+      }
+
+      // Phase 3a: notify hub that a student connected
+      const connectStatus = this.sessionStatus === 'paused' ? 'paused'
+        : this.sessionStatus === 'terminated' ? 'terminated'
+        : 'active';
+      this.reportToHub(undefined, connectStatus as SessionSummary['status']).catch(() => {});
+
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // ── Internal Non-WebSocket Handlers ─────────────────────────────────────
+    // Defense-in-depth: every internal handler MUST carry X-Internal-Auth matching INTERNAL_SECRET
+    if (!verifyInternalAuth(request, this.env as any)) {
+      return forbiddenResponse();
+    }
 
     await this.initialize(sessionId);
 
@@ -204,58 +350,231 @@ export class ExamSessionDO implements DurableObject {
         riskScore: this.session.riskScore,
         riskHistory: this.session.riskHistory,
         violations: this.session.violations,
+        sessionStatus: this.sessionStatus,
+        interventions: this.interventions,
       });
     }
 
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected WebSocket upgrade', { status: 426 });
+    // ── Phase 3b: POST /command endpoint (from ExamHubDO) ───────────────────
+    if (url.pathname.endsWith('/command') && request.method === 'POST') {
+      return this.handleCommand(request);
     }
 
-    // Phase 3a: read examId and studentName from query params
-    this.examId = url.searchParams.get('examId') ?? 'exam-1';
-    const rawName = url.searchParams.get('name') ?? '';
-    this.studentName = rawName || `Student-${sessionId.slice(0, 6)}`;
+    // ── Phase 4c-2b: POST /purge internal endpoint ──────────────────────────
+    if (url.pathname.endsWith('/purge') && request.method === 'POST') {
+      for (const ws of this.sockets) {
+        try {
+          ws.close(1000, 'Session purged');
+        } catch {}
+      }
+      this.sockets.clear();
+      await this.state.storage.deleteAll();
+      this.session = {
+        sessionId: this.session.sessionId,
+        riskScore: 0,
+        riskHistory: [],
+        violations: [],
+      };
+      this.interventions = [];
+      this.pendingCommands = [];
+      this.latestThumbnail = undefined;
+      return Response.json({ ok: true, purged: true });
+    }
 
-    // Create a WebSocket pair: client is returned to the browser,
-    // server stays inside this DO and receives all incoming messages.
-    const { 0: client, 1: server } = new WebSocketPair();
+    // ── Phase 4c-2b: POST /end internal endpoint ────────────────────────────
+    if (url.pathname.endsWith('/end') && request.method === 'POST') {
+      let body: { endedReason?: 'submitted' | 'auto_submitted' | 'terminated'; message?: string } = {};
+      try {
+        body = (await request.json()) as typeof body;
+      } catch {}
+      const reason = body.endedReason || 'submitted';
+      if (reason === 'submitted' || reason === 'auto_submitted') {
+        this.sessionStatus = 'submitted';
+      } else if (reason === 'terminated') {
+        this.sessionStatus = 'terminated';
+      }
+      await this.state.storage.put('sessionStatus', this.sessionStatus);
+      this.reportToHub(undefined, reason === 'terminated' ? 'terminated' : 'submitted').catch(() => {});
+      if (body.message) {
+        for (const ws of this.sockets) {
+          try {
+            this.send(ws, {
+              type: 'command',
+              intervention: {
+                id: uid(),
+                action: 'force_submit',
+                message: body.message,
+                issuedAt: new Date().toISOString(),
+              },
+            } satisfies WSOutboundMsg);
+          } catch {}
+        }
+      }
+      await this.syncToD1(reason);
+      return Response.json({ ok: true, endedReason: reason });
+    }
 
-    // IMPORTANT: Use server.accept() (non-hibernatable mode) + addEventListener.
-    // Do NOT use state.acceptWebSocket() here — that API uses the Hibernatable WS
-    // protocol which requires webSocketMessage() class methods, not addEventListener.
-    // Mixing the two APIs silently drops all incoming messages.
-    server.accept();
-    this.sockets.add(server);
+    return jsonNotFound();
+  }
 
-    server.addEventListener('message', (evt) => {
-      this.handleMessage(server, evt).catch((err) => {
-        console.error('[ExamSessionDO] Unhandled error in handleMessage:', err);
-        this.send(server, { type: 'error', message: String(err) });
-      });
-    });
+  // ─── Phase 3b: Command handler ───────────────────────────────────────────
 
-    server.addEventListener('close', () => {
-      this.sockets.delete(server);
-      // Phase 3a: notify hub that student disconnected
-      this.reportToHub(undefined, 'disconnected').catch(() => {});
-    });
+  /**
+   * Handles a professor command delivered via POST /command from ExamHubDO.
+   * Persists the intervention, optionally changes session status,
+   * and either pushes to connected student sockets or queues for delivery.
+   */
+  private async handleCommand(request: Request): Promise<Response> {
+    const body = await request.json<{ action: InterventionAction; message?: string }>();
+    const { action, message } = body;
 
-    server.addEventListener('error', (err) => {
-      console.error('[ExamSessionDO] WebSocket error event:', err);
-      this.sockets.delete(server);
-    });
+    // Idempotency: pausing an already-paused session is a no-op
+    if (action === 'pause' && this.sessionStatus === 'paused') {
+      return Response.json({ ok: true, status: 'noop', message: 'Session is already paused.' });
+    }
+    if (action === 'resume' && this.sessionStatus !== 'paused') {
+      return Response.json({ ok: true, status: 'noop', message: 'Session is not paused.' });
+    }
+    if (action === 'force_submit' && this.sessionStatus === 'terminated') {
+      return Response.json({ ok: true, status: 'noop', message: 'Session already terminated.' });
+    }
 
-    // Send the full session snapshot to the newly connected client so it can
-    // hydrate its React state without waiting for the first event.
-    this.send(server, {
-      type: 'session_snapshot',
-      session: this.session,
-    } satisfies WSOutboundMsg);
+    // Build intervention record
+    const intervention: Intervention = {
+      id: uid(),
+      action,
+      message,
+      issuedAt: new Date().toISOString(),
+    };
 
-    // Phase 3a: notify hub that a student connected
-    this.reportToHub(undefined, 'active').catch(() => {});
+    // Apply status change
+    if (action === 'pause') {
+      this.sessionStatus = 'paused';
+    } else if (action === 'resume') {
+      this.sessionStatus = 'active';
+    } else if (action === 'force_submit') {
+      this.sessionStatus = 'terminated';
+    }
 
-    return new Response(null, { status: 101, webSocket: client });
+    // Store intervention
+    this.interventions = [...this.interventions, intervention].slice(-50);
+
+    // Persist status and interventions
+    await Promise.all([
+      this.state.storage.put('sessionStatus', this.sessionStatus),
+      this.state.storage.put('interventions', this.interventions),
+    ]);
+
+    // Phase 4b: Update D1 attempt if present
+    if (this.env.DB) {
+      try {
+        const nowIso = intervention.issuedAt;
+        const attempt = await this.env.DB
+          .prepare('SELECT * FROM attempts WHERE session_id = ?')
+          .bind(this.session.sessionId)
+          .first<Record<string, unknown>>();
+
+        if (attempt && attempt.status === 'in_progress') {
+          if (action === 'force_submit') {
+            await doSubmit(this.env.DB, attempt, 'terminated');
+            await this.syncToD1('terminated');
+          } else if (action === 'pause') {
+            if (!attempt.paused_at) {
+              await this.env.DB
+                .prepare('UPDATE attempts SET paused_at = ? WHERE id = ?')
+                .bind(nowIso, attempt.id)
+                .run();
+            }
+          } else if (action === 'resume') {
+            if (attempt.paused_at) {
+              const elapsedSec = Math.max(
+                0,
+                Math.floor((new Date(nowIso).getTime() - new Date(attempt.paused_at as string).getTime()) / 1000),
+              );
+              const newPausedSec = (attempt.paused_seconds as number) + elapsedSec;
+              const oldDeadline = new Date(attempt.deadline_at as string).getTime();
+              const newDeadline = new Date(oldDeadline + elapsedSec * 1000).toISOString();
+              await this.env.DB
+                .prepare(
+                  `UPDATE attempts
+                   SET paused_at = NULL, paused_seconds = ?, deadline_at = ?
+                   WHERE id = ?`,
+                )
+                .bind(newPausedSec, newDeadline, attempt.id)
+                .run();
+            }
+          }
+        } else if (action === 'force_submit') {
+          await this.syncToD1('terminated');
+        }
+      } catch (d1Err) {
+        console.warn('[ExamSessionDO] Failed to sync attempt status to D1:', d1Err);
+      }
+    }
+
+    // Determine delivery status
+    const isConnected = this.sockets.size > 0;
+
+    if (isConnected) {
+      // Push command directly to all connected student sockets
+      this.broadcast({ type: 'command', intervention } satisfies WSOutboundMsg);
+
+      // Report status change to hub with intervention alert
+      const hubStatus: SessionSummary['status'] =
+        this.sessionStatus === 'terminated' ? 'terminated'
+        : this.sessionStatus === 'paused' ? 'paused'
+        : 'active';
+
+      const alert: HubAlert = {
+        sessionId: this.session.sessionId,
+        studentName: this.studentName,
+        eventType: `intervention_${action}`,
+        severity: action === 'force_submit' ? 'critical' : action === 'pause' ? 'high' : 'medium',
+        aiExplanation: message ?? this.defaultInterventionMessage(action),
+        timestamp: intervention.issuedAt,
+        kind: 'intervention',
+      };
+
+      this.reportToHub(alert, hubStatus).catch(() => {});
+
+      return Response.json({ ok: true, status: 'delivered', interventionId: intervention.id });
+    } else {
+      // Student is offline — queue the command for delivery on reconnect
+      // (Only warn can be safely queued; pause + force_submit must also queue since they persist)
+      this.pendingCommands = [...this.pendingCommands, intervention].slice(-20);
+      await this.state.storage.put('pendingCommands', this.pendingCommands);
+
+      // Still report status to hub so grid shows paused/terminated even while offline
+      const hubStatus: SessionSummary['status'] =
+        this.sessionStatus === 'terminated' ? 'terminated'
+        : this.sessionStatus === 'paused' ? 'paused'
+        : 'disconnected';
+
+      const alert: HubAlert = {
+        sessionId: this.session.sessionId,
+        studentName: this.studentName,
+        eventType: `intervention_${action}`,
+        severity: action === 'force_submit' ? 'critical' : action === 'pause' ? 'high' : 'medium',
+        aiExplanation: `[Queued] ${message ?? this.defaultInterventionMessage(action)}`,
+        timestamp: intervention.issuedAt,
+        kind: 'intervention',
+      };
+
+      this.reportToHub(alert, hubStatus).catch(() => {});
+
+      return Response.json({ ok: true, status: 'queued', interventionId: intervention.id, message: 'Student offline — command queued.' });
+    }
+  }
+
+  /** Default human-readable description for each intervention action. */
+  private defaultInterventionMessage(action: InterventionAction): string {
+    const msgs: Record<InterventionAction, string> = {
+      warn: 'You have been issued a warning by the proctor.',
+      pause: 'Your exam has been paused by the proctor.',
+      resume: 'Your exam has been resumed by the proctor.',
+      force_submit: 'Your exam has been ended by the proctor.',
+    };
+    return msgs[action];
   }
 
   // ─── Message handler ─────────────────────────────────────────────────────
@@ -266,23 +585,32 @@ export class ExamSessionDO implements DurableObject {
    * Pipeline:
    *   1. Parse the JSON payload as a `BehavioralEventMsg`.
    *   2. Handle thumbnail messages (Phase 3a) — forward to hub, skip AI.
-   *   3. Apply a naive risk delta (fast, pre-AI estimate).
-   *   4. Call Workers AI to get a refined score + explanation.
-   *   5. Append the new `RiskEvent` and (if applicable) `Violation` to session state.
-   *   6. Persist the updated session to Durable Object Storage.
-   *   7. Broadcast the `risk_update` message to all connected WebSocket clients.
-   *   8. (Phase 3a) Report updated summary + optional alert to ExamHubDO.
+   *   3. Phase 3b: if session is terminated, ignore further behavioral events.
+   *   4. Apply a naive risk delta (fast, pre-AI estimate).
+   *      Phase 3b: while paused, skip risk delta and AI call but still record.
+   *   5. Call Workers AI to get a refined score + explanation.
+   *   6. Append the new `RiskEvent` and (if applicable) `Violation` to session state.
+   *   7. Persist the updated session to Durable Object Storage.
+   *   8. Broadcast the `risk_update` message to all connected WebSocket clients.
+   *   9. (Phase 3a) Report updated summary + optional alert to ExamHubDO.
+   *   10. (Phase 3b) Handle `ack` messages from student and forward to hub.
    *
    * @param socket - The server-side WebSocket that sent this message.
    * @param evt    - The raw MessageEvent from the WebSocket listener.
    */
   private async handleMessage(socket: WebSocket, evt: MessageEvent): Promise<void> {
-    let msg: BehavioralEventMsg;
+    let msg: BehavioralEventMsg & { type?: string; interventionId?: string; action?: string };
 
     try {
-      msg = JSON.parse(evt.data as string) as BehavioralEventMsg;
+      msg = JSON.parse(evt.data as string) as BehavioralEventMsg & { type?: string; interventionId?: string; action?: string };
     } catch {
       this.send(socket, { type: 'error', message: 'Invalid JSON payload' });
+      return;
+    }
+
+    // Phase 3b: handle student acknowledgement of a command
+    if (msg.type === 'command_ack' && msg.interventionId) {
+      await this.handleCommandAck(msg.interventionId);
       return;
     }
 
@@ -292,17 +620,43 @@ export class ExamSessionDO implements DurableObject {
     if (eventType === ('thumbnail' as string) && payload && 'thumbnailBase64' in payload) {
       this.latestThumbnail = (payload as ThumbnailPayload).thumbnailBase64;
       // Forward to hub only (no AI, no storage)
-      this.reportToHub(undefined, 'active').catch(() => {});
+      const status = this.sessionStatus as SessionSummary['status'];
+      this.reportToHub(undefined, status).catch(() => {});
+      return;
+    }
+
+    // Phase 3b: terminated session — ignore further behavioral events
+    if (this.sessionStatus === 'terminated') {
       return;
     }
 
     // Phase 3a: submit exam event — update status in hub and acknowledge
     if (eventType === ('submit' as string)) {
+      this.sessionStatus = 'submitted';
+      await this.state.storage.put('sessionStatus', this.sessionStatus);
       this.reportToHub(undefined, 'submitted').catch(() => {});
+      await this.syncToD1('submitted');
       this.send(socket, {
         type: 'session_snapshot',
         session: this.session,
       } satisfies WSOutboundMsg);
+      return;
+    }
+
+    // Phase 3b: paused session — record event in history but skip risk score changes and AI
+    if (this.sessionStatus === 'paused') {
+      // Record a paused-event entry in history (score unchanged)
+      const now = new Date().toISOString();
+      const pausedEvent: RiskEvent = {
+        timestamp: now,
+        score: this.session.riskScore, // score unchanged
+        triggers: [eventType],
+        aiExplanation: '[Exam paused] Event recorded but risk score frozen.',
+      };
+      this.session.riskHistory = [...this.session.riskHistory, pausedEvent].slice(-50);
+      await this.state.storage.put('session', this.session);
+      // Do NOT broadcast risk_update or call AI; just update hub
+      this.reportToHub(undefined, 'paused').catch(() => {});
       return;
     }
 
@@ -376,6 +730,7 @@ export class ExamSessionDO implements DurableObject {
     // This call survives DO evictions — if the runtime reclaims this DO's memory,
     // the next `initialize()` call will restore state from here.
     await this.state.storage.put('session', this.session);
+    this.syncToD1().catch(() => {});
 
     // Step 7: Broadcast AI result to all connected clients
     this.broadcast({
@@ -398,9 +753,140 @@ export class ExamSessionDO implements DurableObject {
           : undefined,
         aiExplanation: aiResult.explanation,
         timestamp: now,
+        kind: 'violation',
       };
     }
     this.reportToHub(hubAlert, 'active').catch(() => {});
+  }
+
+  // ─── Phase 3b: Command acknowledgement ──────────────────────────────────
+
+  /**
+   * Records that a student has acknowledged an intervention.
+   * Forwards the ack to ExamHubDO so the professor sees it.
+   */
+  private async handleCommandAck(interventionId: string): Promise<void> {
+    const now = new Date().toISOString();
+
+    // Update the intervention record with acknowledgedAt
+    this.interventions = this.interventions.map((inv) =>
+      inv.id === interventionId ? { ...inv, acknowledgedAt: now } : inv
+    );
+    await this.state.storage.put('interventions', this.interventions);
+
+    // Forward ack to hub so professor dashboard shows "Acknowledged"
+    try {
+      const hubId = this.env.EXAM_HUB.idFromName(this.examId);
+      const hubStub = this.env.EXAM_HUB.get(hubId);
+      await hubStub.fetch(new Request('https://hub.internal/command-ack', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Internal-Auth': (this.env as any).INTERNAL_SECRET || '',
+        },
+        body: JSON.stringify({
+          interventionId,
+          sessionId: this.session.sessionId,
+          action: this.interventions.find((i) => i.id === interventionId)?.action ?? 'warn',
+          acknowledgedAt: now,
+        }),
+      }));
+    } catch (err) {
+      console.warn('[ExamSessionDO] Could not forward command_ack to hub:', err);
+    }
+  }
+
+  /**
+   * Phase 4c-2b: Keep D1 in sync with the session Durable Object.
+   * Writes violation_count, max_severity, last_violation_at, and final_risk_score
+   * to the attempts row in D1.
+   * When endedReason is provided ('submitted' | 'auto_submitted' | 'terminated'), this is the FINAL write:
+   * it writes from stored violation list with 3 retry attempts (with backoff).
+   * If all 3 attempts fail, it resets violation_count to NULL so the attempt is treated as unknown (archive only).
+   */
+  public async syncToD1(endedReason?: 'submitted' | 'auto_submitted' | 'terminated'): Promise<void> {
+    if (!this.env.DB || !this.session.sessionId) return;
+
+    const violationCount = this.session.violations.length;
+    let maxSeverity: string | null = null;
+    const severityRank: Record<string, number> = { low: 1, medium: 2, high: 3, critical: 4 };
+    for (const v of this.session.violations) {
+      if (!maxSeverity || (severityRank[v.severity] ?? 0) > (severityRank[maxSeverity] ?? 0)) {
+        maxSeverity = v.severity;
+      }
+    }
+    const lastViolationAt =
+      this.session.violations.length > 0
+        ? this.session.violations[this.session.violations.length - 1].timestamp
+        : null;
+    const finalRiskScore = this.session.riskScore;
+
+    if (!endedReason) {
+      // Intermediate update during exam
+      try {
+        await this.env.DB.prepare(
+          `UPDATE attempts
+           SET violation_count = ?,
+               max_severity = ?,
+               last_violation_at = ?,
+               final_risk_score = ?
+           WHERE session_id = ?`,
+        )
+          .bind(violationCount, maxSeverity, lastViolationAt, finalRiskScore, this.session.sessionId)
+          .run();
+      } catch (err) {
+        console.warn('[ExamSessionDO] Failed intermediate telemetry sync to D1:', err);
+      }
+      return;
+    }
+
+    // Final update at end of attempt: 3 attempts with backoff
+    let writeSuccess = false;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await this.env.DB.prepare(
+          `UPDATE attempts
+           SET violation_count = ?,
+               max_severity = ?,
+               last_violation_at = ?,
+               final_risk_score = ?,
+               ended_reason = ?
+           WHERE session_id = ?`,
+        )
+          .bind(violationCount, maxSeverity, lastViolationAt, finalRiskScore, endedReason, this.session.sessionId)
+          .run();
+        writeSuccess = true;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 50));
+        }
+      }
+    }
+
+    if (!writeSuccess) {
+      console.error(
+        `[ExamSessionDO] Final write failed after 3 attempts for session ${this.session.sessionId}; setting violation_count = NULL:`,
+        lastError,
+      );
+      try {
+        await this.env.DB.prepare(
+          `UPDATE attempts
+           SET violation_count = NULL,
+               ended_reason = ?
+           WHERE session_id = ?`,
+        )
+          .bind(endedReason, this.session.sessionId)
+          .run();
+      } catch (fallbackErr) {
+        console.error(
+          `[ExamSessionDO] Failed fallback write to reset violation_count = NULL for session ${this.session.sessionId}:`,
+          fallbackErr,
+        );
+      }
+    }
   }
 
   // ─── Phase 3a: Hub reporting ─────────────────────────────────────────────
@@ -429,6 +915,7 @@ export class ExamSessionDO implements DurableObject {
         thumbnailBase64: this.latestThumbnail,
         examId: this.examId,
         recentViolations: this.session.violations.slice(-10),
+        interventions: this.interventions.slice(-10),
       };
 
       const body: HubInternalUpdate = { summary, alert };
@@ -441,7 +928,10 @@ export class ExamSessionDO implements DurableObject {
       const hubUrl = new URL(`https://hub.internal/session-event`);
       await hubStub.fetch(new Request(hubUrl.toString(), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Internal-Auth': (this.env as any).INTERNAL_SECRET || '',
+        },
         body: JSON.stringify(body),
       }));
     } catch (err) {
@@ -566,7 +1056,6 @@ Only respond with the JSON object.`;
       normal:              'Behavior appears normal. No violations detected.',
       clipboard_activity:  'Clipboard activity detected — copy/paste operations are monitored during exams.',
       fullscreen_exit:     'Fullscreen mode exited — exam requires fullscreen mode to be active.',
-      right_click_attempt: 'Right-click attempt detected — context menu access is restricted during exams.',
     };
     // Strip payload context suffix (e.g. " (details: ...)") if present
     const baseType = eventType.split(' (')[0];

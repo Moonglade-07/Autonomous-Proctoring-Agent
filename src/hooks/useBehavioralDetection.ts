@@ -38,8 +38,6 @@ export interface MonitoringState {
   isFullscreen: boolean;
   /** Last clipboard action detected, if any */
   lastClipboard: { action: 'copy' | 'paste'; timestamp: string } | null;
-  /** Count of right-click attempts blocked */
-  rightClickCount: number;
 }
 
 interface UseBehavioralDetectionOptions {
@@ -55,7 +53,6 @@ export function useBehavioralDetection({ sendEvent, wsStatus }: UseBehavioralDet
     tabFocused: true,
     isFullscreen: false,
     lastClipboard: null,
-    rightClickCount: 0,
   });
 
   // Track debounce timestamps per event type
@@ -129,11 +126,28 @@ export function useBehavioralDetection({ sendEvent, wsStatus }: UseBehavioralDet
       }
     };
 
-    // ── Right-click ──────────────────────────────────────────────────────
+    // ── Right-click (context menu silently blocked — no event or scoring) ──
     const onContextMenu = (e: MouseEvent) => {
       e.preventDefault();
-      setState((s) => ({ ...s, rightClickCount: s.rightClickCount + 1 }));
-      sendDebounced('right_click_attempt');
+    };
+
+    // ── DevTools & inspect shortcuts (silently blocked — no event or scoring) ──
+    const onKeyDown = (e: KeyboardEvent) => {
+      // F12
+      if (e.key === 'F12') {
+        e.preventDefault();
+        return;
+      }
+      // Ctrl+Shift+I / J / C (or Cmd+Option+I / J / C)
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && ['i', 'I', 'j', 'J', 'c', 'C'].includes(e.key)) {
+        e.preventDefault();
+        return;
+      }
+      // Ctrl+U (or Cmd+U)
+      if ((e.ctrlKey || e.metaKey) && ['u', 'U'].includes(e.key)) {
+        e.preventDefault();
+        return;
+      }
     };
 
     // ── Register listeners ───────────────────────────────────────────────
@@ -144,6 +158,7 @@ export function useBehavioralDetection({ sendEvent, wsStatus }: UseBehavioralDet
     document.addEventListener('paste', onPaste);
     document.addEventListener('fullscreenchange', onFullscreenChange);
     document.addEventListener('contextmenu', onContextMenu);
+    document.addEventListener('keydown', onKeyDown);
 
     // ── Cleanup ──────────────────────────────────────────────────────────
     return () => {
@@ -154,6 +169,7 @@ export function useBehavioralDetection({ sendEvent, wsStatus }: UseBehavioralDet
       document.removeEventListener('paste', onPaste);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       document.removeEventListener('contextmenu', onContextMenu);
+      document.removeEventListener('keydown', onKeyDown);
     };
   }, [state.active, sendDebounced]);
 
@@ -173,7 +189,6 @@ export function useBehavioralDetection({ sendEvent, wsStatus }: UseBehavioralDet
       active: true,
       isFullscreen: !!document.fullscreenElement,
       tabFocused: !document.hidden,
-      rightClickCount: 0,
       lastClipboard: null,
     }));
   }, []);
