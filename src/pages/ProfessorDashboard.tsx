@@ -22,7 +22,7 @@
  *           c) "Force Submit" behind name-confirm dialog
  *       - Intervention history with ack status
  *   • Live Alerts Feed sidebar
- *   • Phase 3b: PROFESSOR_KEY gate (prompt once, persist to sessionStorage)
+ *   • Real-time exam monitoring and interventions (Phase 3b & 5a)
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -31,7 +31,7 @@ import { useHubSocket } from '../hooks/useHubSocket';
 import type { CommandResult } from '../hooks/useHubSocket';
 import { RiskIndicator } from '../components/RiskIndicator';
 import type { SessionSummary, HubAlert, Violation, Intervention, InterventionAction, SessionView, SessionViewCounts, ProfessorAttempt } from '../types';
-import { getProfessorKey, setProfessorKey as saveProfessorKey, clearProfessorKey, fetchExamSessions } from '../hooks/useProfessorApi';
+import { fetchExamSessions } from '../hooks/useProfessorApi';
 import { SessionsView } from '../components/SessionsView';
 
 // ─── Preset Exams ────────────────────────────────────────────────────────────
@@ -725,95 +725,6 @@ function DetailDrawer({ session, onClose, onSendCommand, lastResult }: DetailDra
   );
 }
 
-// ─── Phase 3b: Professor Key Gate ────────────────────────────────────────────
-
-function ProfessorKeyGate({
-  onKeySet,
-}: {
-  onKeySet: (key: string) => void;
-}) {
-  const [input, setInput] = useState('');
-  const [error, setError] = useState('');
-  const [isValidating, setIsValidating] = useState(false);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const key = input.trim();
-    if (!key) {
-      setError('Please enter the professor key.');
-      return;
-    }
-    setIsValidating(true);
-    setError('');
-
-    try {
-      const res = await fetch('/api/professor/exams', {
-        headers: { 'X-Professor-Key': key },
-      });
-      if (res.status === 401) {
-        setError('Unauthorized (HTTP 401): The professor key you entered is incorrect.');
-        setIsValidating(false);
-        return;
-      }
-    } catch {
-      // If network offline in local dev, allow proceed
-    }
-
-    setIsValidating(false);
-    saveProfessorKey(key);
-    onKeySet(key);
-  };
-
-  return (
-    <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center p-4">
-      <div className="max-w-sm w-full">
-        <div className="text-center mb-8">
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-violet-600 to-indigo-500 flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg shadow-violet-500/25">
-            🛡️
-          </div>
-          <h1 className="text-xl font-bold text-white">Professor Access</h1>
-          <p className="text-sm text-gray-400 mt-2 leading-relaxed">
-            Enter the professor key to access the live proctoring monitor and send interventions.
-          </p>
-        </div>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="text-xs font-bold text-gray-400 uppercase tracking-wider block mb-1.5">
-              Professor Key
-            </label>
-            <input
-              type="password"
-              id="professor-key-input"
-              value={input}
-              onChange={(e) => { setInput(e.target.value); setError(''); }}
-              placeholder="Enter secret key…"
-              autoFocus
-              className="w-full bg-gray-800 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors"
-            />
-            {error && <p className="text-xs text-red-400 mt-1.5">{error}</p>}
-          </div>
-
-          <button
-            type="submit"
-            id="professor-key-submit"
-            disabled={isValidating}
-            className="w-full py-3 rounded-xl text-sm font-bold bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white shadow-lg shadow-violet-900/40 transition-all cursor-pointer active:scale-[0.98] disabled:opacity-50"
-          >
-            {isValidating ? 'Verifying Key…' : 'Access Monitor'}
-          </button>
-        </form>
-
-        <p className="text-[11px] text-gray-600 text-center mt-6 leading-relaxed">
-          The key is stored in sessionStorage only — closing this tab clears it.
-          <br />
-          Set it via <code className="text-gray-500">npx wrangler secret put PROFESSOR_KEY</code>.
-        </p>
-      </div>
-    </div>
-  );
-}
-
 // ─── Main Professor Dashboard Component ──────────────────────────────────────
 
 export function ProfessorDashboard({ fixedExamId }: { fixedExamId?: string } = {}) {
@@ -827,12 +738,7 @@ export function ProfessorDashboard({ fixedExamId }: { fixedExamId?: string } = {
     }
   }, [fixedExamId, examId]);
 
-  // Phase 3b: professor key gate
-  const [professorKey, setProfessorKey] = useState<string | null>(() => {
-    return getProfessorKey() || null;
-  });
-
-  const { sessions, alerts, status, sendCommand, commandResults } = useHubSocket({ examId, professorKey: professorKey ?? '' });
+  const { sessions, alerts, status, sendCommand, commandResults } = useHubSocket({ examId });
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedAttempt, setSelectedAttempt] = useState<ProfessorAttempt | null>(null);
@@ -957,11 +863,6 @@ export function ProfessorDashboard({ fixedExamId }: { fixedExamId?: string } = {
     ? commandResults.find((r) => r.sessionId === selectedId)
     : undefined;
 
-  // If no key set, show gate
-  if (!professorKey) {
-    return <ProfessorKeyGate onKeySet={setProfessorKey} />;
-  }
-
   return (
     <div className="min-h-screen bg-gray-950 text-white font-sans flex flex-col selection:bg-violet-500 selection:text-white">
 
@@ -1041,34 +942,19 @@ export function ProfessorDashboard({ fixedExamId }: { fixedExamId?: string } = {
               </div>
             )}
 
-            {/* Phase 3b: clear key button */}
-            <button
-              onClick={() => { clearProfessorKey(); setProfessorKey(null); }}
-              className="text-[10px] px-2 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 border border-white/10 transition-colors cursor-pointer"
-              title="Clear professor key"
-            >
-              🔑 Change Key
-            </button>
-
             {/* Live Hub status dot */}
             <WSStatusIndicator status={status} />
           </div>
         </div>
       </header>
 
-      {/* ── Key Auth Error Banner ────────────────────────────────────────── */}
+      {/* ── Hub Error Banner ────────────────────────────────────────── */}
       {status === 'error' && (
         <div className="bg-red-950/80 border-b border-red-500/30 px-4 py-2.5 text-xs text-red-300 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span>⚠️</span>
-            <span>Connection unauthorized or rejected. The professor key is invalid or missing.</span>
+            <span>Live monitor connection disconnected or unauthorized.</span>
           </div>
-          <button
-            onClick={() => { clearProfessorKey(); setProfessorKey(null); }}
-            className="px-2.5 py-1 rounded bg-red-800 hover:bg-red-700 text-white font-semibold transition-colors cursor-pointer"
-          >
-            Re-enter Key
-          </button>
         </div>
       )}
 

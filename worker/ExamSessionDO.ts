@@ -231,24 +231,41 @@ export class ExamSessionDO implements DurableObject {
     if (isWs) {
       // 4. NO STATE FOR UNKNOWN SESSIONS: check D1 before creating or writing any state
       if (this.env.DB && sessionId && sessionId !== 'unknown') {
-        const attempt = await this.env.DB.prepare('SELECT id FROM attempts WHERE session_id = ?')
+        const attempt = await this.env.DB.prepare('SELECT id, exam_id, student_name FROM attempts WHERE session_id = ?')
           .bind(sessionId)
-          .first<{ id: string }>();
+          .first<{ id: string; exam_id: string; student_name: string | null }>();
         if (!attempt) {
           return jsonNotFound();
         }
+        if (attempt.exam_id) this.examId = attempt.exam_id;
+        if (attempt.student_name) this.studentName = attempt.student_name;
       }
 
       await this.initialize(sessionId);
 
-      // Phase 3a: read examId and studentName from query params
-      this.examId = url.searchParams.get('examId') ?? 'exam-1';
-      const rawName = url.searchParams.get('name') ?? '';
-      this.studentName = rawName || `Student-${sessionId.slice(0, 6)}`;
+      // Phase 3a: read examId and studentName from verified query params
+      if (url.searchParams.get('examId')) {
+        this.examId = url.searchParams.get('examId')!;
+      }
+      const rawName = url.searchParams.get('studentName') || url.searchParams.get('name');
+      if (rawName) {
+        this.studentName = rawName;
+      }
+      if (!this.studentName) {
+        this.studentName = `Student-${sessionId.slice(0, 6)}`;
+      }
 
       // Create a WebSocket pair: client is returned to the browser,
       // server stays inside this DO and receives all incoming messages.
       const { 0: client, 1: server } = new WebSocketPair();
+
+      // One live student connection per session: close any previous connection
+      for (const existingSocket of this.sockets) {
+        try {
+          existingSocket.close(4001, 'This exam is open in another window');
+        } catch {}
+      }
+      this.sockets.clear();
 
       // IMPORTANT: Use server.accept() (non-hibernatable mode) + addEventListener.
       // Do NOT use state.acceptWebSocket() here — that API uses the Hibernatable WS

@@ -31,6 +31,8 @@ import { canAccessExam } from '../utils/auth.js';
 export { canAccessExam } from '../utils/auth.js';
 import { handleGradingApi } from './grading.js';
 import { handleSessionsApi } from './sessions.js';
+import { requireAuth, isAuthResponse } from '../auth/requireAuth.js';
+import { writeAuditLog } from '../utils/audit.js';
 import {
   QuestionCreateSchema,
 } from '../utils/questionGrading.js';
@@ -38,10 +40,11 @@ import type { DerivedExamStatus } from '../types.js';
 
 interface DbEnv {
   DB: D1Database;
-  PROFESSOR_KEY?: string;
+  JWT_SECRET?: string;
   AI?: Ai;
   EXAM_SESSION?: DurableObjectNamespace;
   EXAM_HUB?: DurableObjectNamespace;
+  INTERNAL_SECRET?: string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -123,15 +126,6 @@ function jsonErr(message: string, status: number, details?: unknown): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
-}
-
-function checkAuth(request: Request, env: DbEnv): Response | null {
-  const expectedKey = env.PROFESSOR_KEY;
-  const provided = request.headers.get('X-Professor-Key') ?? '';
-  if (!provided || (expectedKey && provided !== expectedKey)) {
-    return jsonErr('Unauthorized: Invalid or missing X-Professor-Key header', 401);
-  }
-  return null;
 }
 
 function computeDerivedStatus(
@@ -320,22 +314,23 @@ async function snapshotExamQuestions(db: D1Database, examId: string): Promise<vo
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export async function handleProfessorApi(request: Request, env: DbEnv): Promise<Response> {
-  const authErr = checkAuth(request, env);
-  if (authErr) return authErr;
+  const auth = await requireAuth(request, env, ['professor', 'admin']);
+  if (isAuthResponse(auth)) return auth;
+  const user = auth.user;
 
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/api\/professor/, '');
   const method = request.method.toUpperCase();
 
   // ── Delegate to grading API ────────────────────────────────────────────────
-  const gradingRes = await handleGradingApi(request, env as unknown as Parameters<typeof handleGradingApi>[1], path, method);
+  const gradingRes = await handleGradingApi(request, env as any, path, method, user);
   if (gradingRes !== null) return gradingRes;
 
-  // ── Delegate to sessions API (Phase 4c-2b) ─────────────────────────────────
+  // ── Delegate to sessions API (Phase 4c-2b & 5a) ────────────────────────────
   const sessionsMatch = path.match(/^\/exams\/([^/]+)\/(sessions.*|preview-start)$/);
   if (sessionsMatch) {
     const examId = sessionsMatch[1];
-    return handleSessionsApi(request, env as unknown as Parameters<typeof handleSessionsApi>[1], path, method, examId);
+    return handleSessionsApi(request, env as any, path, method, examId, user);
   }
 
   // ── GET /exams ─────────────────────────────────────────────────────────────
@@ -343,14 +338,20 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
     const search = url.searchParams.get('search')?.trim() || '';
     const status = url.searchParams.get('status')?.trim() || '';
 
-    const rows = await env.DB.prepare(
-      `SELECT e.*,
+    const baseSql = `SELECT e.*,
               (SELECT COUNT(*) FROM questions q WHERE q.exam_id = e.id) AS question_count,
               (SELECT COALESCE(SUM(q.points), 0) FROM questions q WHERE q.exam_id = e.id) AS total_points,
               (SELECT COUNT(*) FROM exam_enrollments en WHERE en.exam_id = e.id) AS student_count
-       FROM exams e
-       ORDER BY e.created_at DESC`,
-    ).all<Record<string, unknown>>();
+       FROM exams e`;
+
+    let rows;
+    if (user.role === 'admin') {
+      rows = await env.DB.prepare(`${baseSql} ORDER BY e.created_at DESC`).all<Record<string, unknown>>();
+    } else {
+      rows = await env.DB.prepare(`${baseSql} WHERE e.created_by = ? ORDER BY e.created_at DESC`)
+        .bind(user.id)
+        .all<Record<string, unknown>>();
+    }
 
     let list: Record<string, unknown>[] = rows.results.map((e) => {
       const derived = computeDerivedStatus(
@@ -419,8 +420,8 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
          id, title, description, course_code, duration_minutes,
          start_time, end_time, status, strictness, enable_vision,
          enable_identity, max_risk_score, show_answers, join_code,
-         join_code_active, retention_days, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', 'medium', 1, 1, 80, 0, ?, 1, ?, ?, ?)`,
+         join_code_active, retention_days, created_by, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', 'medium', 1, 1, 80, 0, ?, 1, ?, ?, ?, ?)`,
     )
       .bind(
         examId,
@@ -432,6 +433,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
         d.end_time ?? null,
         joinCode,
         d.retention_days ?? 90,
+        user.id,
         createdAt,
         createdAt,
       )
@@ -458,8 +460,8 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
     return jsonErr('Exam not found', 404);
   }
 
-  if (!canAccessExam(rawExam)) {
-    return jsonErr('Forbidden', 403);
+  if (!canAccessExam(rawExam, user)) {
+    return jsonErr('Exam not found', 404);
   }
 
   // ── GET /exams/:id ─────────────────────────────────────────────────────────
@@ -564,8 +566,8 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
          id, title, description, course_code, duration_minutes,
          start_time, end_time, status, strictness, enable_vision,
          enable_identity, max_risk_score, show_answers, join_code,
-         join_code_active, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+         join_code_active, created_by, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
     )
       .bind(
         newExamId,
@@ -581,6 +583,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
         rawExam.max_risk_score,
         rawExam.show_answers,
         joinCode,
+        user.id,
         createdAt,
         createdAt,
       )
@@ -683,6 +686,216 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
 
     const published = await getExamWithQuestions(env.DB, examId);
     return jsonOk({ exam: published });
+  }
+
+  // ── POST /exams/:id/close ──────────────────────────────────────────────────
+  if (subPath === '/close' && method === 'POST') {
+    const nowIso = now();
+    await env.DB.prepare('UPDATE exams SET status = ?, join_code_active = 0, updated_at = ? WHERE id = ?')
+      .bind('closed', nowIso, examId)
+      .run();
+
+    await writeAuditLog(env.DB, {
+      action: 'close_exam',
+      target: examId,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+      meta: { examTitle: rawExam.title },
+    });
+
+    const updated = await getExamWithQuestions(env.DB, examId);
+    return jsonOk({ closed: true, exam: updated });
+  }
+
+  // ── POST /exams/:id/reset ──────────────────────────────────────────────────
+  if (subPath === '/reset' && method === 'POST') {
+    let body: { dryRun?: boolean; confirmTitle?: string; force?: boolean } = {};
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {}
+
+    const { dryRun, confirmTitle, force } = body;
+
+    // Fetch all attempts for counts, violation checks, and deletion
+    const allAttempts = await env.DB.prepare(
+      `SELECT id, student_name, status, score, fully_graded, graded_at, violation_count, evidence_hold, is_test, session_id
+       FROM attempts
+       WHERE exam_id = ?`,
+    )
+      .bind(examId)
+      .all<{
+        id: string;
+        student_name: string;
+        status: string;
+        score: number | null;
+        fully_graded: number;
+        graded_at: string | null;
+        violation_count: number | null;
+        evidence_hold: number;
+        is_test: number;
+        session_id: string | null;
+      }>();
+
+    const attemptList = allAttempts.results;
+    const attemptIds = attemptList.map((a) => a.id);
+
+    let answersCount = 0;
+    if (attemptIds.length > 0) {
+      const placeholders = attemptIds.map(() => '?').join(',');
+      const ansRow = await env.DB.prepare(
+        `SELECT COUNT(*) AS count FROM answers WHERE attempt_id IN (${placeholders})`,
+      )
+        .bind(...attemptIds)
+        .first<{ count: number }>();
+      answersCount = ansRow?.count ?? 0;
+    }
+
+    // 1. Dry Run Preview: returns counts of attempts and answers that would be deleted
+    if (dryRun) {
+      return jsonOk({
+        dryRun: true,
+        wouldDeleteAttempts: attemptList.length,
+        wouldDeleteAnswers: answersCount,
+        attemptsCount: attemptList.length,
+        answersCount,
+      });
+    }
+
+    // 2. Refuse with 409 if any non-test attempt is in_progress (a student is taking the exam right now),
+    // with NO force override allowed.
+    const hasInProgress = attemptList.some((a) => a.is_test !== 1 && a.status === 'in_progress');
+    if (hasInProgress) {
+      return jsonErr(
+        'Cannot reset exam: Close the exam and wait for attempts to end, or end them first.',
+        409,
+      );
+    }
+
+    // 3. Treat every non-test attempt with status IN ('submitted','auto_submitted','terminated')
+    // as completed work, plus any attempt with a non-null score or any answers rows.
+    // These require force = true and confirmTitle, as already implemented.
+    const nonTestAttemptList = attemptList.filter((a) => a.is_test !== 1);
+    const nonTestAttemptIds = nonTestAttemptList.map((a) => a.id);
+    let nonTestAnswersCount = 0;
+    if (nonTestAttemptIds.length > 0) {
+      const placeholders = nonTestAttemptIds.map(() => '?').join(',');
+      const ansRow = await env.DB.prepare(
+        `SELECT COUNT(*) AS count FROM answers WHERE attempt_id IN (${placeholders})`,
+      )
+        .bind(...nonTestAttemptIds)
+        .first<{ count: number }>();
+      nonTestAnswersCount = ansRow?.count ?? 0;
+    }
+
+    const isResultsReleased = rawExam.results_released === 1;
+    const hasCompletedWork =
+      isResultsReleased ||
+      nonTestAttemptList.some(
+        (a) =>
+          ['submitted', 'auto_submitted', 'terminated'].includes(a.status) ||
+          a.score !== null ||
+          a.fully_graded === 1 ||
+          a.graded_at !== null,
+      ) ||
+      nonTestAnswersCount > 0;
+
+    if (hasCompletedWork) {
+      const titleMatches =
+        typeof confirmTitle === 'string' &&
+        confirmTitle.trim().toLowerCase() === String(rawExam.title).trim().toLowerCase();
+
+      if (!force || !titleMatches) {
+        return jsonErr(
+          'Cannot reset exam: Results have been released or graded/submitted attempts exist. ' +
+            'To reset, confirmTitle must match the exam title and force must be true.',
+          409,
+        );
+      }
+    }
+
+    // 3. Phase 4c-2b Violation and Evidence-Hold Integrity Rules:
+    // Even with force, keep the existing violation and evidence-hold refusals:
+    for (const att of attemptList) {
+      if (att.is_test === 1) continue; // test attempts can always be cleared
+      if (att.evidence_hold === 1) {
+        return jsonErr('Cannot reset exam: One or more attempts have evidence hold active. Archive attempts instead.', 409);
+      }
+      if (att.violation_count === null || att.violation_count === undefined) {
+        return jsonErr('Cannot reset exam: Violation count unknown for one or more attempts. Archive attempts instead.', 409);
+      }
+      if (Number(att.violation_count) > 0) {
+        return jsonErr(
+          `Cannot reset exam: Attempt ${att.id} has violations (${att.violation_count}). Under Phase 4c-2b rules, attempts with violations cannot be deleted or cleared. Archive attempts instead.`,
+          409,
+        );
+      }
+    }
+
+    // 4. All existing attempts are clean (violation_count = 0 and evidence_hold = 0) or test attempts
+    // Safely purge and delete them in accordance with Phase 4c-2b lifecycle
+    for (const att of attemptList) {
+      // Hub removal
+      if (env.EXAM_HUB && att.session_id) {
+        try {
+          const hubId = env.EXAM_HUB.idFromName(examId);
+          const stub = env.EXAM_HUB.get(hubId);
+          await stub.fetch('http://internal/internal/remove-session', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Internal-Auth': env.INTERNAL_SECRET || '',
+            },
+            body: JSON.stringify({ sessionId: att.session_id }),
+          });
+        } catch {}
+      }
+
+      // DO purge
+      if (env.EXAM_SESSION && att.session_id) {
+        try {
+          const doId = env.EXAM_SESSION.idFromName(att.session_id);
+          const stub = env.EXAM_SESSION.get(doId);
+          await stub.fetch('http://internal/purge', {
+            method: 'POST',
+            headers: {
+              'X-Internal-Auth': env.INTERNAL_SECRET || '',
+            },
+          });
+        } catch {}
+      }
+
+      await env.DB.prepare('DELETE FROM answers WHERE attempt_id = ?').bind(att.id).run();
+      await env.DB.prepare('DELETE FROM attempts WHERE id = ?').bind(att.id).run();
+    }
+
+    // Clean up enrollments
+    await env.DB.prepare('DELETE FROM exam_enrollments WHERE exam_id = ?').bind(examId).run();
+
+    // Reset status to draft
+    const nowIso = now();
+    await env.DB.prepare('UPDATE exams SET status = ?, updated_at = ? WHERE id = ?')
+      .bind('draft', nowIso, examId)
+      .run();
+
+    // Write audit log entry with counts
+    await writeAuditLog(env.DB, {
+      action: 'reset_exam',
+      target: examId,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+      meta: {
+        examTitle: rawExam.title,
+        deletedAttemptsCount: attemptList.length,
+        deletedAnswersCount: answersCount,
+        forced: !!force,
+      },
+    });
+
+    const resetExam = await getExamWithQuestions(env.DB, examId);
+    return jsonOk({
+      reset: true,
+      exam: resetExam,
+      deletedAttemptsCount: attemptList.length,
+      deletedAnswersCount: answersCount,
+    });
   }
 
   // ── POST /exams/:id/regenerate-code ────────────────────────────────────────
@@ -871,8 +1084,8 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
       return jsonErr('Source exam not found', 404);
     }
 
-    if (!canAccessExam(sourceExam)) {
-      return jsonErr('Forbidden: cannot access source exam', 403);
+    if (!canAccessExam(sourceExam, user)) {
+      return jsonErr('Source exam not found', 404);
     }
 
     const maxPosRow = await env.DB.prepare(

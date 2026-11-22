@@ -22,16 +22,6 @@
 		"binding": "AI"
 	},
 
-	// ── Phase 3b: Professor key secret ──────────────────────────────────────
-	// Set via: npx wrangler secret put PROFESSOR_KEY
-	// Then enter any secret string (e.g. "prof-secret-2024").
-	// For local dev add PROFESSOR_KEY=your-secret to a .dev.vars file.
-	// The professor dashboard prompts for this key once and stores it in
-	// sessionStorage. Mismatches are rejected with 401.
-	"vars": {
-		"PROFESSOR_KEY_HINT": "Set PROFESSOR_KEY via `npx wrangler secret put PROFESSOR_KEY`"
-	},
-
 	// ── Phase 4a: D1 Database ───────────────────────────────────────────────
 	// 1. Create the database:   npx wrangler d1 create apa-db
 	// 2. Copy the database_id from the output and paste it below.

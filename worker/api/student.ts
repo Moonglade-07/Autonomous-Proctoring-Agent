@@ -24,11 +24,13 @@ import {
   type QuestionForGrading,
 } from '../utils/questionGrading.js';
 import type { StudentQuestion, DerivedExamStatus, ResultStatus } from '../types.js';
+import { requireAuth, isAuthResponse } from '../auth/requireAuth.js';
 
 export { gradeAttempt, toStudentQuestion };
 
 interface StudentEnv {
   DB: D1Database;
+  JWT_SECRET?: string;
   EXAM_SESSION?: DurableObjectNamespace;
   INTERNAL_SECRET?: string;
 }
@@ -117,22 +119,8 @@ async function getStudentQuestions(db: D1Database, examId: string): Promise<Stud
 
 const JoinSchema = z.object({
   code: z.string().min(1, 'Join code is required'),
-  studentName: z.string().trim().min(1, 'Student name is required').max(100),
+  studentName: z.string().optional(),
 });
-
-const StartSchema = z
-  .object({
-    name: z.string().min(1).max(100).optional(),
-    studentName: z.string().min(1).max(100).optional(),
-    session_id: z.string().min(1).max(128).optional(),
-    sessionId: z.string().min(1).max(128).optional(),
-  })
-  .refine(
-    (data) => Boolean(data.name || data.studentName) && Boolean(data.session_id || data.sessionId),
-    {
-      message: 'studentName (or name) and sessionId (or session_id) are required',
-    },
-  );
 
 const AnswerEntrySchema = z.object({
   question_id: z.string().min(1).optional(),
@@ -154,6 +142,12 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     return cors(new Response(null, { status: 204 }));
   }
 
+  const auth = await requireAuth(request, env as any, ['student']);
+  if (isAuthResponse(auth)) {
+    return auth;
+  }
+  const user = auth.user;
+
   // ── POST /join ─────────────────────────────────────────────────────────────
   if (path === '/join' && method === 'POST') {
     let body: unknown;
@@ -169,7 +163,6 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     }
 
     const rawCode = parsed.data.code;
-    const studentName = parsed.data.studentName.trim();
     const normalizedCode = normalizeJoinCode(rawCode);
 
     // Rate limit check: max 10 failed joins per IP in 10 minutes
@@ -207,7 +200,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
       await env.DB.prepare(
         'INSERT INTO join_attempts (id, ip, student_name, attempted_at, success) VALUES (?, ?, ?, ?, 0)',
       )
-        .bind(attemptId, ip, studentName, attemptTime)
+        .bind(attemptId, ip, user.name, attemptTime)
         .run();
 
       return err('Invalid or inactive code', 400);
@@ -217,17 +210,37 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     await env.DB.prepare(
       'INSERT INTO join_attempts (id, ip, student_name, attempted_at, success) VALUES (?, ?, ?, ?, 1)',
     )
-      .bind(attemptId, ip, studentName, attemptTime)
+      .bind(attemptId, ip, user.name, attemptTime)
       .run();
 
-    // Enroll student (idempotent)
-    await env.DB.prepare(
-      `INSERT INTO exam_enrollments (exam_id, student_name, joined_at)
-       VALUES (?, ?, ?)
-       ON CONFLICT(exam_id, student_name) DO NOTHING`,
+    // Enroll student (idempotent, by user_id)
+    const existingEnrollment = await env.DB.prepare(
+      'SELECT id FROM exam_enrollments WHERE exam_id = ? AND user_id = ?',
     )
-      .bind(exam.id, studentName, attemptTime)
-      .run();
+      .bind(exam.id, user.id)
+      .first<{ id: string }>();
+
+    if (!existingEnrollment) {
+      const enrollId = `en-${crypto.randomUUID()}`;
+      try {
+        await env.DB.prepare(
+          `INSERT INTO exam_enrollments (id, exam_id, user_id, joined_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(exam_id, user_id) WHERE user_id IS NOT NULL DO NOTHING`,
+        )
+          .bind(enrollId, exam.id, user.id, attemptTime)
+          .run();
+      } catch (insertErr) {
+        const check = await env.DB.prepare(
+          'SELECT id FROM exam_enrollments WHERE exam_id = ? AND user_id = ?',
+        )
+          .bind(exam.id, user.id)
+          .first<{ id: string }>();
+        if (!check) {
+          throw insertErr;
+        }
+      }
+    }
 
     return json({
       id: exam.id,
@@ -244,22 +257,17 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
 
   // ── GET /my-exams ──────────────────────────────────────────────────────────
   if (path === '/my-exams' && method === 'GET') {
-    const name = url.searchParams.get('name')?.trim();
-    if (!name) {
-      return err('Student name parameter is required', 400);
-    }
-
     const rows = await env.DB.prepare(
       `SELECT e.id, e.title, e.course_code, e.duration_minutes, e.start_time, e.end_time, e.status, en.joined_at,
               e.results_released, e.instant_results,
               a.id as attempt_id, a.status as attempt_status, a.score, a.max_score, a.fully_graded, a.grading_status
        FROM exam_enrollments en
        JOIN exams e ON en.exam_id = e.id
-       LEFT JOIN attempts a ON a.exam_id = e.id AND a.student_name = en.student_name
-       WHERE en.student_name = ?
+       LEFT JOIN attempts a ON a.exam_id = e.id AND a.user_id = en.user_id AND (a.is_test = 0 OR a.is_test IS NULL)
+       WHERE en.user_id = ?
        ORDER BY en.joined_at DESC`,
     )
-      .bind(name)
+      .bind(user.id)
       .all<Record<string, unknown>>();
 
     const exams = rows.results.map((r) => {
@@ -319,52 +327,55 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
   }
 
   // ── GET /exams/:id ──────────────────────────────────────────────────────────
+  // Metadata ONLY — requires active enrollment, returns 404 without enrollment.
+  // Questions are NEVER returned here; they are only provided via POST /start for active attempts.
   const examDetailMatch = path.match(/^\/exams\/([^/]+)$/);
   if (method === 'GET' && examDetailMatch) {
     const examId = examDetailMatch[1];
-    const exam = await getExam(env.DB, examId);
-    if (!exam) return err('Exam not found', 404);
-    if (exam.status === 'draft') return err('Exam is not available', 403);
 
-    let questions: StudentQuestion[];
-    try {
-      questions = await getStudentQuestions(env.DB, examId);
-    } catch (e) {
-      return err((e as Error).message, 500);
+    // Enrollment check: student must have joined/enrolled in this exam
+    const enrollment = await env.DB.prepare(
+      'SELECT 1 FROM exam_enrollments WHERE exam_id = ? AND user_id = ?',
+    )
+      .bind(examId, user.id)
+      .first();
+
+    if (!enrollment) {
+      return err('Exam not found', 404);
     }
+
+    const exam = await getExam(env.DB, examId);
+    if (!exam || exam.status === 'draft') return err('Exam not found', 404);
 
     return json({
       exam: {
         id: exam.id,
         title: exam.title,
         description: exam.description,
+        course: exam.course_code,
         course_code: exam.course_code,
+        duration: exam.duration_minutes,
         duration_minutes: exam.duration_minutes,
         start_time: exam.start_time,
         end_time: exam.end_time,
         status: exam.status,
         show_answers: exam.show_answers,
       },
-      questions,
     });
   }
 
-  // ── GET /exams/:id/attempt?name=... ─────────────────────────────────────────
+  // ── GET /exams/:id/attempt ─────────────────────────────────────────────────
   const examAttemptMatch = path.match(/^\/exams\/([^/]+)\/attempt$/);
   if (method === 'GET' && examAttemptMatch) {
     const examId = examAttemptMatch[1];
-    const name = url.searchParams.get('name')?.trim();
-    if (!name) {
-      return err('Student name parameter is required', 400);
-    }
 
     const exam = await getExam(env.DB, examId);
     if (!exam) return err('Exam not found', 404);
 
     const attempt = await env.DB.prepare(
-      `SELECT * FROM attempts WHERE exam_id = ? AND student_name = ?`,
+      `SELECT * FROM attempts WHERE exam_id = ? AND user_id = ? AND (is_test = 0 OR is_test IS NULL)`,
     )
-      .bind(examId, name)
+      .bind(examId, user.id)
       .first<Record<string, unknown>>();
 
     return json({
@@ -389,23 +400,11 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
   if (method === 'POST' && startMatch) {
     const examId = startMatch[1];
 
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return err('Invalid JSON body', 400);
-    }
-
-    const parsed = StartSchema.safeParse(body);
-    if (!parsed.success) return err(parsed.error.message, 400);
-    const name = (parsed.data.name ?? parsed.data.studentName)!.trim();
-    const session_id = (parsed.data.session_id ?? parsed.data.sessionId)!.trim();
-
     // Enrollment check: student must have joined the exam
     const enrollment = await env.DB.prepare(
-      'SELECT 1 FROM exam_enrollments WHERE exam_id = ? AND student_name = ?',
+      'SELECT 1 FROM exam_enrollments WHERE exam_id = ? AND user_id = ?',
     )
-      .bind(examId, name)
+      .bind(examId, user.id)
       .first();
 
     if (!enrollment) {
@@ -429,9 +428,9 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
 
     // Check for existing attempt
     const existing = await env.DB.prepare(
-      'SELECT * FROM attempts WHERE exam_id = ? AND student_name = ?',
+      'SELECT * FROM attempts WHERE exam_id = ? AND user_id = ? AND (is_test = 0 OR is_test IS NULL)',
     )
-      .bind(examId, name)
+      .bind(examId, user.id)
       .first<Record<string, unknown>>();
 
     if (existing) {
@@ -484,14 +483,15 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     const startedAt = new Date(nowMs).toISOString();
     const deadlineAt = new Date(deadlineMs).toISOString();
     const attemptId = nanoId('at');
+    const sessionId = `sess-${crypto.randomUUID()}`;
 
     await env.DB.prepare(
-      `INSERT INTO attempts (id, exam_id, student_name, session_id, status,
+      `INSERT INTO attempts (id, exam_id, user_id, student_name, session_id, status,
                              started_at, deadline_at, paused_seconds, max_score, grading_status,
-                             violation_count, final_risk_score)
-       VALUES (?,?,?,?,'in_progress',?,?,0,?,'pending_manual',0,0)`,
+                             is_test, violation_count, final_risk_score)
+       VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, 0, ?, 'pending_manual', 0, 0, 0)`,
     )
-      .bind(attemptId, examId, name, session_id, startedAt, deadlineAt, maxScore)
+      .bind(attemptId, examId, user.id, user.name, sessionId, startedAt, deadlineAt, maxScore)
       .run();
 
     const attempt = await getAttempt(env.DB, attemptId);
@@ -518,9 +518,12 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     }
 
     const attempt = await getAttempt(env.DB, attemptId);
-    if (!attempt) return err('Attempt not found', 404);
+    if (!attempt || attempt.user_id !== user.id) return err('Attempt not found', 404);
     if (attempt.status !== 'in_progress') {
       return err(`Attempt is ${attempt.status as string} — cannot accept answers`, 409);
+    }
+    if (attempt.paused_at) {
+      return err('Exam is paused by the proctor — cannot accept answers', 409);
     }
 
     // Reject if deadline passed
@@ -586,7 +589,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
   if (method === 'GET' && timeMatch) {
     const attemptId = timeMatch[1];
     const attempt = await getAttempt(env.DB, attemptId);
-    if (!attempt) return err('Attempt not found', 404);
+    if (!attempt || attempt.user_id !== user.id) return err('Attempt not found', 404);
 
     if (
       attempt.status === 'in_progress' &&
@@ -614,7 +617,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
   if (method === 'POST' && submitMatch) {
     const attemptId = submitMatch[1];
     const attempt = await getAttempt(env.DB, attemptId);
-    if (!attempt) return err('Attempt not found', 404);
+    if (!attempt || attempt.user_id !== user.id) return err('Attempt not found', 404);
 
     if (attempt.status !== 'in_progress') {
       return json({ attempt, submitted: true, idempotent: true });
@@ -648,7 +651,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
   if (method === 'GET' && resultMatch) {
     const attemptId = resultMatch[1];
     const attempt = await getAttempt(env.DB, attemptId);
-    if (!attempt) return err('Attempt not found', 404);
+    if (!attempt || attempt.user_id !== user.id) return err('Attempt not found', 404);
 
     if (attempt.status === 'in_progress') {
       return err('Exam is still in progress', 403);

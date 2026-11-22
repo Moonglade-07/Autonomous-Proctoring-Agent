@@ -1,18 +1,35 @@
 /**
- * worker/utils/auth.ts
+ * worker/utils/auth.ts — Centralized exam ownership and access helper
  * ─────────────────────────────────────────────────────────────────────────────
- * Centralized authorization access helper for exams.
- * In Phase 4c-1, returns true if exam exists.
- * Phase 5 will add user identity and ownership checks in this single function.
+ * Allowed if:
+ *   - user.role === 'admin', OR
+ *   - exam.created_by === user.id
+ *
+ * Legacy exams with created_by NULL are accessible to admins ONLY until claimed.
+ * If access is denied, professor routes must return 404 (not 403) to prevent
+ * exam enumeration.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import type { User } from '../auth/types.js';
+
 export function canAccessExam(
   exam: Record<string, unknown> | null | undefined,
-  _professorKey?: string | null,
+  user: User | { id: string; role: string } | null | undefined,
 ): boolean {
-  if (!exam) return false;
-  // In Phase 5, this will check: exam.professor_id === professor.id
-  return true;
-}
+  if (!exam || !user) return false;
 
+  // Admins can access all exams (including legacy unclaimed exams)
+  if (user.role === 'admin') {
+    return true;
+  }
+
+  // Non-admins can only access exams they created
+  const createdBy = exam.created_by as string | null | undefined;
+  if (!createdBy) {
+    // Legacy exams with created_by = NULL are visible to admins ONLY until claimed
+    return false;
+  }
+
+  return createdBy === user.id;
+}

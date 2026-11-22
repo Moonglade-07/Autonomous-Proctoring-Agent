@@ -29,7 +29,48 @@ import {
   type QuestionForGrading,
 } from '../worker/utils/questionGrading';
 import { canAccessExam } from '../worker/utils/auth';
-import { handleStudentApi } from '../worker/api/student';
+import { handleStudentApi as rawHandleStudentApi } from '../worker/api/student';
+import { signJwt } from '../worker/auth/jwt';
+import { serializeAuthCookie } from '../worker/auth/cookies';
+import type { User } from '../worker/auth/types';
+
+const TEST_SECRET = 'test-secret-key-for-jwt-signing-minimum-32-chars-long';
+
+const mockStudentUser: User = {
+  id: 'student-test',
+  email: 'student@test.com',
+  name: 'Student Test',
+  role: 'student',
+  password_hash: '',
+  password_salt: '',
+  student_id: 'S1',
+  department: null,
+  active: 1,
+  token_version: 0,
+  created_at: new Date().toISOString(),
+  last_login_at: null,
+};
+
+const handleStudentApi = async (req: Request, env: any) => {
+  const token = await signJwt({ sub: 'student-test', role: 'student', tv: 0 }, TEST_SECRET);
+  const cookie = serializeAuthCookie(token);
+  const headers = new Headers(req.headers);
+  if (!headers.has('Cookie')) {
+    headers.set('Cookie', cookie);
+  }
+  if (!headers.has('Origin') && req.method !== 'GET' && req.method !== 'HEAD') {
+    headers.set('Origin', 'http://localhost');
+  }
+  const proxiedReq = new Request(req.url, {
+    method: req.method,
+    headers,
+    body: req.body,
+    // @ts-ignore
+    duplex: 'half',
+  });
+  const finalEnv = { JWT_SECRET: TEST_SECRET, ...env };
+  return rawHandleStudentApi(proxiedReq, finalEnv);
+};
 
 describe('Phase 4c-1: Join Code Generation & Formatting', () => {
   it('generates codes of exact length 8 using the 32-character alphabet without I, O, 0, 1', () => {
@@ -68,10 +109,15 @@ describe('Phase 4c-1: Join Code Generation & Formatting', () => {
 });
 
 describe('Phase 4c-1: Exam Authorization Helper', () => {
-  it('canAccessExam returns true for now (Phase 4 placeholder before Phase 5 auth)', () => {
-    const exam = { id: 'exam-1', title: 'Test Exam' };
-    expect(canAccessExam(exam, 'any-key')).toBe(true);
-    expect(canAccessExam(exam, undefined)).toBe(true);
+  it('canAccessExam verifies owner and admin access', () => {
+    const exam = { id: 'exam-1', title: 'Test Exam', created_by: 'prof-1' };
+    const owner = { id: 'prof-1', role: 'professor' } as any;
+    const admin = { id: 'admin-1', role: 'admin' } as any;
+    const otherProf = { id: 'prof-2', role: 'professor' } as any;
+    expect(canAccessExam(exam, owner)).toBe(true);
+    expect(canAccessExam(exam, admin)).toBe(true);
+    expect(canAccessExam(exam, otherProf)).toBe(false);
+    expect(canAccessExam(exam, undefined)).toBe(false);
   });
 });
 
@@ -87,6 +133,9 @@ describe('Phase 4c-1: Anti-Probing & Join Flow Security', () => {
           bind(...args: unknown[]) {
             return {
               async first<T = Record<string, unknown>>(): Promise<T | null> {
+                if (query.includes('FROM users WHERE id = ?')) {
+                  return mockStudentUser as T;
+                }
                 if (query.includes('FROM join_attempts')) {
                   return { count: handlers.failCount ?? 0 } as T;
                 }

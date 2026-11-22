@@ -43,10 +43,9 @@ export interface CommandAckRecord {
 
 interface UseHubSocketOptions {
   examId: string;
-  professorKey?: string;
 }
 
-export function useHubSocket({ examId, professorKey }: UseHubSocketOptions) {
+export function useHubSocket({ examId }: UseHubSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<WSStatus>('connecting');
   const [sessions, setSessions] = useState<Record<string, SessionSummary>>({});
@@ -60,8 +59,7 @@ export function useHubSocket({ examId, professorKey }: UseHubSocketOptions) {
     if (!mountedRef.current) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const keyQuery = professorKey ? `?key=${encodeURIComponent(professorKey)}` : '';
-    const wsUrl = `${protocol}//${window.location.host}/api/hub/${encodeURIComponent(examId)}${keyQuery}`;
+    const wsUrl = `${protocol}//${window.location.host}/api/hub/${encodeURIComponent(examId)}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -142,7 +140,7 @@ export function useHubSocket({ examId, professorKey }: UseHubSocketOptions) {
         }, 3000);
       }
     };
-  }, [examId, professorKey]);
+  }, [examId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -156,7 +154,7 @@ export function useHubSocket({ examId, professorKey }: UseHubSocketOptions) {
 
   /**
    * Phase 3b: Issue a professor command to a student session.
-   * Sends a 'command' message over the hub WebSocket, including the professor key.
+   * Sends a 'command' message over the hub WebSocket.
    *
    * @param sessionId - Target student session
    * @param action    - 'warn' | 'pause' | 'resume' | 'force_submit'
@@ -175,11 +173,10 @@ export function useHubSocket({ examId, professorKey }: UseHubSocketOptions) {
           sessionId,
           action,
           message,
-          key: professorKey ?? '',
         })
       );
     },
-    [professorKey]
+    []
   );
 
   return { sessions, alerts, status, sendCommand, commandResults, commandAcks };

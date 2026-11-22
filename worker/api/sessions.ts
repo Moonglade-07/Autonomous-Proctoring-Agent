@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { canAccessExam } from '../utils/auth.js';
 import { toStudentQuestion } from './student.js';
 import { writeAuditLog } from '../utils/audit.js';
+import type { User } from '../auth/types.js';
 
 function json<T>(data: T, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -38,8 +39,6 @@ function nanoId(prefix: string): string {
 
 export interface SessionsEnv {
   DB: D1Database;
-  PROFESSOR_KEY?: string;
-  PROFESSOR_KEY_HINT?: string;
   EXAM_SESSION?: DurableObjectNamespace;
   EXAM_HUB?: DurableObjectNamespace;
   INTERNAL_SECRET?: string;
@@ -65,14 +64,13 @@ export async function handleSessionsApi(
   subPath: string,
   method: string,
   examId: string,
+  user: User,
 ): Promise<Response> {
-  const professorKey = request.headers.get('X-Professor-Key');
   const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
     .bind(examId)
     .first<Record<string, unknown>>();
-  const hasAccess = canAccessExam(exam, professorKey);
-  if (!hasAccess) {
-    return err('Unauthorized: Invalid or missing professor key, or exam not found.', 401);
+  if (!exam || !canAccessExam(exam, user)) {
+    return err('Exam not found', 404);
   }
 
   const url = new URL(request.url);
@@ -780,13 +778,14 @@ export async function handleSessionsApi(
       `INSERT INTO attempts (
          id, exam_id, student_name, session_id, status,
          started_at, deadline_at, paused_seconds, max_score,
-         grading_status, is_test, violation_count, final_risk_score
-       ) VALUES (?, ?, ?, ?, 'in_progress', ?, ?, 0, ?, 'auto_graded', 1, 0, 0)`,
+         grading_status, is_test, user_id, violation_count, final_risk_score
+       ) VALUES (?, ?, ?, ?, 'in_progress', ?, ?, 0, ?, 'auto_graded', 1, ?, 0, 0)`,
     )
-      .bind(attemptId, examId, studentName, sessionId, startedAt, deadlineAt, maxScore)
+      .bind(attemptId, examId, studentName, sessionId, startedAt, deadlineAt, maxScore, user.id)
       .run();
 
     await writeAuditLog(env.DB, {
+      actor_user_id: user.id,
       action: 'preview_start',
       target: attemptId,
       ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',

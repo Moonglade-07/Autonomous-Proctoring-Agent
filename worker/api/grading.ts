@@ -14,10 +14,10 @@
 
 import { z } from 'zod';
 import { canAccessExam } from '../utils/auth.js';
+import type { User } from '../auth/types.js';
 
 export interface GradingEnv {
   DB: D1Database;
-  PROFESSOR_KEY?: string;
   AI?: Ai;
   EXAM_SESSION?: DurableObjectNamespace;
   INTERNAL_SECRET?: string;
@@ -37,15 +37,6 @@ function jsonErr(message: string, status: number, details?: unknown): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
-}
-
-function checkAuth(request: Request, env: GradingEnv): Response | null {
-  const expectedKey = env.PROFESSOR_KEY;
-  const provided = request.headers.get('X-Professor-Key') ?? '';
-  if (!provided || (expectedKey && provided !== expectedKey)) {
-    return jsonErr('Unauthorized: Invalid or missing X-Professor-Key header', 401);
-  }
-  return null;
 }
 
 function now(): string {
@@ -81,20 +72,18 @@ export async function handleGradingApi(
   env: GradingEnv,
   path: string,
   method: string,
+  user: User,
 ): Promise<Response | null> {
   // ── GET /exams/:id/submissions ─────────────────────────────────────────────
   const submissionsMatch = path.match(/^\/exams\/([^/]+)\/submissions$/);
   if (method === 'GET' && submissionsMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const examId = submissionsMatch[1];
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(examId)
       .first<Record<string, unknown>>();
     if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!canAccessExam(exam, user)) {
+      return jsonErr('Exam not found', 404);
     }
 
     const includeTest = new URL(request.url).searchParams.get('include_test') === '1';
@@ -121,9 +110,6 @@ export async function handleGradingApi(
   // ── GET /attempts/:attemptId/grading ──────────────────────────────────────
   const gradingViewMatch = path.match(/^\/attempts\/([^/]+)\/grading$/);
   if (method === 'GET' && gradingViewMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const attemptId = gradingViewMatch[1];
     const attempt = await env.DB.prepare('SELECT * FROM attempts WHERE id = ?')
       .bind(attemptId)
@@ -133,9 +119,8 @@ export async function handleGradingApi(
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(attempt.exam_id)
       .first<Record<string, unknown>>();
-    if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!exam || !canAccessExam(exam, user)) {
+      return jsonErr('Attempt not found', 404);
     }
 
     // Get snapshot questions with correct answers + rubric (professor-only view)
@@ -204,9 +189,6 @@ export async function handleGradingApi(
   // ── GET /exams/:id/grading/questions/:qid ─────────────────────────────────
   const blindMatch = path.match(/^\/exams\/([^/]+)\/grading\/questions\/([^/]+)$/);
   if (method === 'GET' && blindMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const examId = blindMatch[1];
     const questionId = blindMatch[2];
     const url = new URL(request.url);
@@ -215,9 +197,8 @@ export async function handleGradingApi(
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(examId)
       .first<Record<string, unknown>>();
-    if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!exam || !canAccessExam(exam, user)) {
+      return jsonErr('Exam not found', 404);
     }
 
     // Get question from snapshot
@@ -297,9 +278,6 @@ export async function handleGradingApi(
   // ── PUT /attempts/:attemptId/answers/:qid/grade ───────────────────────────
   const gradeMatch = path.match(/^\/attempts\/([^/]+)\/answers\/([^/]+)\/grade$/);
   if (method === 'PUT' && gradeMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const attemptId = gradeMatch[1];
     const questionId = gradeMatch[2];
 
@@ -330,9 +308,8 @@ export async function handleGradingApi(
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(attempt.exam_id)
       .first<Record<string, unknown>>();
-    if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!exam || !canAccessExam(exam, user)) {
+      return jsonErr('Attempt not found', 404);
     }
 
     // Load question from snapshot
@@ -430,9 +407,6 @@ export async function handleGradingApi(
   // ── POST /attempts/:attemptId/answers/:qid/suggest-grade ──────────────────
   const suggestMatch = path.match(/^\/attempts\/([^/]+)\/answers\/([^/]+)\/suggest-grade$/);
   if (method === 'POST' && suggestMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const attemptId = suggestMatch[1];
     const questionId = suggestMatch[2];
 
@@ -444,9 +418,8 @@ export async function handleGradingApi(
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(attempt.exam_id)
       .first<Record<string, unknown>>();
-    if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!exam || !canAccessExam(exam, user)) {
+      return jsonErr('Attempt not found', 404);
     }
 
     // Rate limit: 20 per minute per exam
@@ -624,16 +597,12 @@ ${studentAnswerText}
   // ── POST /exams/:id/release-results ───────────────────────────────────────
   const releaseMatch = path.match(/^\/exams\/([^/]+)\/release-results$/);
   if (method === 'POST' && releaseMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const examId = releaseMatch[1];
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(examId)
       .first<Record<string, unknown>>();
-    if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!exam || !canAccessExam(exam, user)) {
+      return jsonErr('Exam not found', 404);
     }
 
     const stats = await env.DB.prepare(
@@ -667,16 +636,12 @@ ${studentAnswerText}
   // ── POST /exams/:id/unrelease-results ─────────────────────────────────────
   const unreleaseMatch = path.match(/^\/exams\/([^/]+)\/unrelease-results$/);
   if (method === 'POST' && unreleaseMatch) {
-    const authErr = checkAuth(request, env);
-    if (authErr) return authErr;
-
     const examId = unreleaseMatch[1];
     const exam = await env.DB.prepare('SELECT * FROM exams WHERE id = ?')
       .bind(examId)
       .first<Record<string, unknown>>();
-    if (!exam) return jsonErr('Exam not found', 404);
-    if (!canAccessExam(exam, request.headers.get('X-Professor-Key') ?? '')) {
-      return jsonErr('Forbidden', 403);
+    if (!exam || !canAccessExam(exam, user)) {
+      return jsonErr('Exam not found', 404);
     }
 
     await env.DB.prepare(

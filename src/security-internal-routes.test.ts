@@ -18,8 +18,53 @@ import worker from '../worker/index';
 import { ExamSessionDO } from '../worker/ExamSessionDO';
 import { ExamHubDO } from '../worker/ExamHubDO';
 import { constantTimeCompare, verifyInternalAuth } from '../worker/utils/internalAuth';
+import { signJwt } from '../worker/auth/jwt';
+import { serializeAuthCookie } from '../worker/auth/cookies';
+import type { User } from '../worker/auth/types';
 
 // ─── Test Helpers & Mocks ────────────────────────────────────────────────────
+
+const TEST_JWT_SECRET = 'jwt-secret-key-for-test-32bytes-long-super-secure!';
+
+const mockProfUser: User = {
+  id: 'prof-test',
+  email: 'prof@test.com',
+  name: 'Professor Test',
+  role: 'professor',
+  password_hash: '',
+  password_salt: '',
+  student_id: null,
+  department: null,
+  active: 1,
+  token_version: 0,
+  created_at: new Date().toISOString(),
+  last_login_at: null,
+};
+
+const mockStudentUser: User = {
+  id: 'student-test',
+  email: 'student@test.com',
+  name: 'Student Test',
+  role: 'student',
+  password_hash: '',
+  password_salt: '',
+  student_id: 'S1',
+  department: null,
+  active: 1,
+  token_version: 0,
+  created_at: new Date().toISOString(),
+  last_login_at: null,
+};
+
+async function createProfCookie() {
+  const token = await signJwt({ sub: 'prof-test', role: 'professor', tv: 0 }, TEST_JWT_SECRET);
+  return serializeAuthCookie(token);
+}
+
+async function createStudentCookie() {
+  const token = await signJwt({ sub: 'student-test', role: 'student', tv: 0 }, TEST_JWT_SECRET);
+  return serializeAuthCookie(token);
+}
 
 interface MockDbConfig {
   attempts?: Record<string, unknown>[];
@@ -37,21 +82,25 @@ function createMockDb(config: MockDbConfig = {}) {
         return makeStatement(query, args);
       },
       async first<T = Record<string, unknown>>(): Promise<T | null> {
+        if (query.includes('FROM users WHERE id = ?')) {
+          const id = boundArgs[0];
+          return (id === 'prof-test' ? mockProfUser : mockStudentUser) as T | null;
+        }
         if (query.includes('FROM attempts WHERE session_id = ?')) {
           const sessId = boundArgs[0];
           const found = attempts.find((a) => a.session_id === sessId);
-          return (found ?? null) as T | null;
+          return (found ? { user_id: 'student-test', is_test: 0, ...found } : null) as T | null;
         }
         if (query.includes('FROM attempts WHERE exam_id = ? AND session_id = ?')) {
           const examId = boundArgs[0];
           const sessId = boundArgs[1];
           const found = attempts.find((a) => a.exam_id === examId && a.session_id === sessId);
-          return (found ?? null) as T | null;
+          return (found ? { user_id: 'student-test', is_test: 0, ...found } : null) as T | null;
         }
         if (query.includes('FROM exams WHERE id = ?')) {
           const examId = boundArgs[0];
           const found = exams.find((e) => e.id === examId);
-          return (found ?? null) as T | null;
+          return (found ? { created_by: 'prof-test', ...found } : null) as T | null;
         }
         return null;
       },
@@ -136,8 +185,8 @@ function createMockEnv(db: ReturnType<typeof createMockDb>) {
 
   return {
     DB: db as unknown as D1Database,
-    PROFESSOR_KEY: 'test-prof-key',
     INTERNAL_SECRET: TEST_INTERNAL_SECRET,
+    JWT_SECRET: TEST_JWT_SECRET,
     EXAM_SESSION: mockSessionDO as unknown as DurableObjectNamespace,
     EXAM_HUB: mockHubDO as unknown as DurableObjectNamespace,
     ASSETS: assets as unknown as Fetcher,
@@ -200,7 +249,10 @@ describe('Security & Internal Durable Object Routes', () => {
       ];
 
       for (const ep of forbiddenEndpoints) {
-        const req = new Request(`http://localhost${ep.path}`, { method: ep.method });
+        const req = new Request(`http://localhost${ep.path}`, {
+          method: ep.method,
+          headers: { Origin: 'http://localhost' },
+        });
         const res = await worker.fetch(req, env as any);
 
         expect(res.status).toBe(404);
@@ -229,7 +281,10 @@ describe('Security & Internal Durable Object Routes', () => {
       ];
 
       for (const ep of endpoints) {
-        const req = new Request(`http://localhost${ep.path}`, { method: ep.method });
+        const req = new Request(`http://localhost${ep.path}`, {
+          method: ep.method,
+          headers: { Origin: 'http://localhost' },
+        });
         const res = await worker.fetch(req, env as any);
 
         expect(res.status).toBe(404);
@@ -265,11 +320,11 @@ describe('Security & Internal Durable Object Routes', () => {
 
     it('returns JSON 404 for plain HTTP requests to /api/hub/:examId without WebSocket upgrade', async () => {
       const db = createMockDb({
-        exams: [{ id: 'exam-1', professor_key: 'test-prof-key' }],
+        exams: [{ id: 'exam-1' }],
       });
       const env = createMockEnv(db);
 
-      const req = new Request('http://localhost/api/hub/exam-1?key=test-prof-key', { method: 'GET' });
+      const req = new Request('http://localhost/api/hub/exam-1', { method: 'GET' });
       const res = await worker.fetch(req, env as any);
 
       expect(res.status).toBe(404);
@@ -285,14 +340,14 @@ describe('Security & Internal Durable Object Routes', () => {
       const env = createMockEnv(db);
 
       const invalidReq1 = new Request('http://localhost/api/exam/sess!invalid@id', {
-        headers: { Upgrade: 'websocket' },
+        headers: { Upgrade: 'websocket', Origin: 'http://localhost' },
       });
       const res1 = await worker.fetch(invalidReq1, env as any);
       expect(res1.status).toBe(404);
 
       const tooLongId = 'a'.repeat(65);
       const invalidReq2 = new Request(`http://localhost/api/exam/${tooLongId}`, {
-        headers: { Upgrade: 'websocket' },
+        headers: { Upgrade: 'websocket', Origin: 'http://localhost' },
       });
       const res2 = await worker.fetch(invalidReq2, env as any);
       expect(res2.status).toBe(404);
@@ -351,9 +406,10 @@ describe('Security & Internal Durable Object Routes', () => {
         attempts: [], // Empty attempts table
       });
       const env = createMockEnv(db);
+      const studentCookie = await createStudentCookie();
 
       const req = new Request('http://localhost/api/exam/unknown-session-1234', {
-        headers: { Upgrade: 'websocket' },
+        headers: { Upgrade: 'websocket', Origin: 'http://localhost', Cookie: studentCookie },
       });
 
       const res = await worker.fetch(req, env as any);
@@ -393,14 +449,16 @@ describe('Security & Internal Durable Object Routes', () => {
             exam_id: 'exam-1',
             session_id: 'sess-preview-1',
             student_name: 'Preview-ABCD',
+            user_id: 'prof-test',
             is_test: 1,
           },
         ],
       });
       const env = createMockEnv(db);
+      const profCookie = await createProfCookie();
 
       const req = new Request('http://localhost/api/exam/sess-preview-1', {
-        headers: { Upgrade: 'websocket' },
+        headers: { Upgrade: 'websocket', Origin: 'http://localhost', Cookie: profCookie },
       });
 
       const res = await worker.fetch(req, env as any);
@@ -485,7 +543,6 @@ describe('Security & Internal Durable Object Routes', () => {
     it('ExamHubDO rejects internal handlers with 403 when X-Internal-Auth is missing or invalid', async () => {
       const mockState = createMockState();
       const mockDOEnv = {
-        PROFESSOR_KEY: 'test-prof-key',
         INTERNAL_SECRET: TEST_INTERNAL_SECRET,
       };
 
@@ -545,7 +602,6 @@ describe('Security & Internal Durable Object Routes', () => {
     it('ExamHubDO accepts internal endpoints when valid X-Internal-Auth is provided', async () => {
       const mockState = createMockState();
       const mockDOEnv = {
-        PROFESSOR_KEY: 'test-prof-key',
         INTERNAL_SECRET: TEST_INTERNAL_SECRET,
       };
 
@@ -607,7 +663,7 @@ describe('Security & Internal Durable Object Routes', () => {
         // Test with both unset and empty secret in env
         for (const envWithoutSecret of [{}, { INTERNAL_SECRET: '' }, { INTERNAL_SECRET: undefined }]) {
           const sessionDO = new ExamSessionDO(mockState1 as any, { DB: db as any, ...envWithoutSecret } as any);
-          const hubDO = new ExamHubDO(mockState2 as any, { PROFESSOR_KEY: 'prof-key', ...envWithoutSecret } as any);
+          const hubDO = new ExamHubDO(mockState2 as any, { ...envWithoutSecret } as any);
 
           // Internal session handler: even with empty header or arbitrary header, returns 403
           const sessionReq = new Request('http://internal/history?sessionId=sess-1', {
@@ -631,23 +687,25 @@ describe('Security & Internal Durable Object Routes', () => {
   describe('Internal Professor History Lookup Route', () => {
     it('allows authorized professors to lookup session history via /api/professor/exams/:id/sessions/:sessionId/history', async () => {
       const db = createMockDb({
-        exams: [{ id: 'exam-1', professor_key: 'test-prof-key' }],
+        exams: [{ id: 'exam-1', created_by: 'prof-test' }],
         attempts: [
           {
             id: 'att-1',
             exam_id: 'exam-1',
             session_id: 'sess-history-ok',
             student_name: 'Alice',
+            user_id: 'student-test',
             data_purged_at: null,
           },
         ],
       });
       const env = createMockEnv(db);
+      const profCookie = await createProfCookie();
 
       const req = new Request('http://localhost/api/professor/exams/exam-1/sessions/sess-history-ok/history', {
         method: 'GET',
         headers: {
-          'X-Professor-Key': 'test-prof-key',
+          Cookie: profCookie,
         },
       });
 
@@ -664,23 +722,25 @@ describe('Security & Internal Durable Object Routes', () => {
 
     it('returns purged notice if session data was purged by retention policy', async () => {
       const db = createMockDb({
-        exams: [{ id: 'exam-1', professor_key: 'test-prof-key' }],
+        exams: [{ id: 'exam-1', created_by: 'prof-test' }],
         attempts: [
           {
             id: 'att-purged',
             exam_id: 'exam-1',
             session_id: 'sess-purged-1',
             student_name: 'Bob',
+            user_id: 'student-test',
             data_purged_at: new Date().toISOString(),
           },
         ],
       });
       const env = createMockEnv(db);
+      const profCookie = await createProfCookie();
 
       const req = new Request('http://localhost/api/professor/exams/exam-1/sessions/sess-purged-1/history', {
         method: 'GET',
         headers: {
-          'X-Professor-Key': 'test-prof-key',
+          Cookie: profCookie,
         },
       });
 
@@ -697,8 +757,8 @@ describe('Security & Internal Durable Object Routes', () => {
     it('rejects history lookup with 404 when session exists but belongs to a different exam (cross-exam isolation)', async () => {
       const db = createMockDb({
         exams: [
-          { id: 'exam-A', professor_key: 'test-prof-key' },
-          { id: 'exam-B', professor_key: 'test-prof-key' },
+          { id: 'exam-A', created_by: 'prof-test' },
+          { id: 'exam-B', created_by: 'prof-test' },
         ],
         attempts: [
           {
@@ -706,17 +766,19 @@ describe('Security & Internal Durable Object Routes', () => {
             exam_id: 'exam-B', // session belongs to exam-B
             session_id: 'sess-belonging-to-b',
             student_name: 'Charlie',
+            user_id: 'student-test',
             data_purged_at: null,
           },
         ],
       });
       const env = createMockEnv(db);
+      const profCookie = await createProfCookie();
 
       // Professor queries exam-A with a session ID that belongs to exam-B
       const req = new Request('http://localhost/api/professor/exams/exam-A/sessions/sess-belonging-to-b/history', {
         method: 'GET',
         headers: {
-          'X-Professor-Key': 'test-prof-key',
+          Cookie: profCookie,
         },
       });
 

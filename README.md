@@ -198,23 +198,25 @@ Professors can actively intervene in student sessions directly from the monitor:
 
 ---
 
-## Setting Up `PROFESSOR_KEY` (Security Guard)
+## Setting Up Authentication & Secrets (Phase 5a)
 
-The professor dashboard and hub endpoints are protected by a shared secret key until Phase 5 authentication is introduced:
+The platform uses signed HS256 JWT cookies for role-based authentication and a shared internal secret for Durable Object communication:
 
 ### For Cloudflare Production Deployments:
 ```bash
-npx wrangler secret put PROFESSOR_KEY
-# Enter your secret key (e.g., "my-secret-prof-key")
+# 1. JWT secret for user authentication cookies:
+npx wrangler secret put JWT_SECRET
+
+# 2. Internal defense-in-depth secret for Durable Object routing:
+npx wrangler secret put INTERNAL_SECRET
 ```
 
 ### For Local Development:
 Create or edit a `.dev.vars` file in the project root:
 ```env
-PROFESSOR_KEY=my-secret-prof-key
+INTERNAL_SECRET=my-long-random-internal-secret-token-32bytes-hex
+JWT_SECRET=my-long-random-jwt-signing-secret-token-32bytes-hex
 ```
-
-When navigating to `/professor`, the dashboard prompts for the key once, saves it in `sessionStorage`, and connects to the hub WebSocket with `?key=...`. Mismatches are rejected with HTTP 401 Unauthorized.
 
 ---
 
@@ -232,8 +234,8 @@ npx wrangler secret put INTERNAL_SECRET
 ### For Local Development:
 Add `INTERNAL_SECRET` to your `.dev.vars` file:
 ```env
-PROFESSOR_KEY=my-secret-prof-key
 INTERNAL_SECRET=my-long-random-internal-secret-token-32bytes-hex
+JWT_SECRET=my-long-random-jwt-signing-secret-token-32bytes-hex
 ```
 
 > **Security Note:** `INTERNAL_SECRET` is used exclusively for internal DO-to-DO, Worker-to-DO, and cron worker communications. It is never logged and never exposed in client responses or public API endpoints.
@@ -268,7 +270,7 @@ npm run db:seed:local
 
 ### API Routes (/api/professor/*)
 
-All routes require X-Professor-Key header matching PROFESSOR_KEY secret.
+All routes require authenticated session cookie (`auth_token`) and execute `canAccessExam`.
 
 ## Phase 4c-1: Exam-Centric Architecture, Join Codes, & Student Lobby
 
@@ -282,17 +284,19 @@ Phase 4c-1 restructures the platform around the **exam as the container**:
 
 ### Professor API Routes (`/api/professor/*`)
 
-Requires `X-Professor-Key` header. Centralized access check via `canAccessExam`.
+Requires authenticated session cookie (`auth_token`) with `professor` or `admin` role. Centralized access check via `canAccessExam`.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/professor/exams` | List exams with question counts, points, student counts, and derived status |
+| GET | `/api/professor/exams` | List exams owned by the professor with question counts, points, student counts, and derived status |
 | POST | `/api/professor/exams` | Create exam (short form, auto-generates join code) |
 | GET | `/api/professor/exams/:id` | Get exam details with questions and counts |
 | PUT | `/api/professor/exams/:id` | Update exam metadata/settings (duration, schedule, proctoring) |
 | DELETE | `/api/professor/exams/:id` | Delete exam (drafts only) |
 | POST | `/api/professor/exams/:id/duplicate` | Duplicate exam (copies questions with fresh IDs + generates new join code) |
 | POST | `/api/professor/exams/:id/publish` | Publish exam (freezes questions into snapshot) |
+| POST | `/api/professor/exams/:id/close` | Close exam (sets `status = 'closed'`, `join_code_active = 0`) |
+| POST | `/api/professor/exams/:id/reset` | Reset exam to draft. Supports `{ dryRun: true }` preview. Requires `{ force: true, confirmTitle }` if attempts submitted/graded or results released. Blocks if violations or evidence hold exist. |
 | POST | `/api/professor/exams/:id/regenerate-code` | Regenerate join code (draft only) |
 | PUT | `/api/professor/exams/:id/toggle-code` | Toggle join code active/inactive |
 | GET | `/api/professor/exams/:id/attempts` | List student submissions/attempts for this exam |
@@ -301,24 +305,36 @@ Requires `X-Professor-Key` header. Centralized access check via `canAccessExam`.
 | PUT | `/api/professor/exams/:id/questions/:qid` | Update question (draft only) |
 | DELETE | `/api/professor/exams/:id/questions/:qid` | Delete question (draft only) |
 | PUT | `/api/professor/exams/:id/questions/reorder` | Reorder questions in this exam |
-| POST | `/api/professor/exams/:id/questions/import` | Copy questions from another exam (fresh IDs, non-shared) |
+| POST | `/api/professor/exams/:id/questions/import` | Copy questions from another exam (fresh IDs, non-shared; requires access to both exams) |
 
 ---
 
 ### Student API Routes (`/api/student/*`)
 
-No professor key required. Anti-probing and rate-limited.
+Requires authenticated session cookie (`auth_token`) with `student` role (or admin). Enforces enrollment and anti-probing guarantees.
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/student/join` | Join exam with code + student name (anti-probing generic error; 10 failed joins/10 min rate limit) |
-| GET | `/api/student/my-exams?name=` | List exams student has enrolled in with status and score |
-| GET | `/api/student/exams/:id` | Get exam metadata and questions (strictly safe `StudentQuestion`) |
-| POST | `/api/student/exams/:id/start` | Start or resume attempt (requires prior enrollment in `exam_enrollments`, otherwise 403) |
-| PUT | `/api/student/attempts/:id/answers` | Autosave answers (batch; rejected if deadline passed) |
-| GET | `/api/student/attempts/:id/time` | Re-sync server-authoritative timer (countdown seconds, paused status) |
-| POST | `/api/student/attempts/:id/submit` | Finalize and grade attempt server-side (idempotent) |
-| GET | `/api/student/attempts/:id/result` | Retrieve attempt score, status, and optional answer review (if `show_answers = 1`) |
+| POST | `/api/student/join` | Join exam with code (enforces active account, creates `exam_enrollments` record, rate limited) |
+| GET | `/api/student/my-exams` | List exams student is enrolled in with status and score |
+| GET | `/api/student/exams/:id` | Get exam metadata only (duration, window, title, course). Requires enrollment row (otherwise 404); NEVER returns questions. |
+| POST | `/api/student/exams/:id/start` | Start or resume attempt (requires prior enrollment). Returns safe student questions (`toStudentQuestion()`). |
+| PUT | `/api/student/attempts/:id/answers` | Autosave answers (batch; rejected if deadline passed or attempt not owned) |
+| GET | `/api/student/attempts/:id/time` | Re-sync server-authoritative timer (countdown seconds, paused status; requires attempt ownership) |
+| POST | `/api/student/attempts/:id/submit` | Finalize and grade attempt server-side (idempotent; requires attempt ownership) |
+| GET | `/api/student/attempts/:id/result` | Retrieve attempt score, status, and optional answer review (if `show_answers = 1`; requires attempt ownership) |
+
+---
+
+### Admin API Routes (`/api/admin/*`)
+
+Requires authenticated session cookie (`auth_token`) with `admin` role.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/admin/users` | Create user with explicit role (`student`, `professor`, `admin`) |
+| POST | `/api/admin/users/:id/deactivate` | Deactivate user (`active = 0`) and invalidate all active sessions (`token_version + 1`) |
+| POST | `/api/admin/claim-legacy-exams` | Assign legacy exams (`created_by IS NULL`) to an admin or designated professor |
 
 ---
 
@@ -346,19 +362,17 @@ No professor key required. Anti-probing and rate-limited.
 
 ---
 
-### Pre-Authentication Limitations (Until Phase 5)
+### Legacy Authentication History (Pre-Phase 5a)
 
-Phase 4c-1 operates with `PROFESSOR_KEY` and unauthenticated student identifiers (`?name=`):
+Prior to Phase 5a, the platform operated with temporary development secrets and unauthenticated student identifiers (`?name=`):
 
 1. **Unauthenticated Name Collisions**:
-   - Enrollment and attempts are keyed on `(exam_id, student_name)` in D1 SQLite.
-   - Anyone typing an existing student's exact name will resume that student's attempt and inherit their saved answers.
-   - Names are case-sensitive (`"alice"` and `"Alice"` are treated as two distinct students).
+   - Enrollment and attempts were keyed on `(exam_id, student_name)` in D1 SQLite.
+   - Anyone typing an existing student's exact name resumed that student's attempt.
 2. **Incognito Pause State**:
-   - Professor interventions (`pause` / `resume`) are tracked per `sessionId` in Durable Object memory.
-   - If an incognito window opens the exam with the same student name and generates a new `sessionId`, the new session will not inherit the previous WebSocket pause state until refreshed.
+   - Professor interventions (`pause` / `resume`) were tracked per `sessionId` in Durable Object memory.
 
-> **Resolution:** Both limitations will be eliminated in **Phase 5 (Authentication & RBAC)**, where attempts, sessions, and proctoring interventions will be bound to authenticated student accounts and JWT tokens.
+> **Resolution:** Both limitations were eliminated in **Phase 5a (Authentication & RBAC)**, where attempts, sessions, and proctoring interventions are bound to authenticated student accounts and JWT tokens.
 
 ---
 
@@ -402,7 +416,7 @@ Phase 4c-2a delivers full post-exam lifecycle management:
 
 ### Professor Grading API Routes (`/api/professor/*`)
 
-All routes require `X-Professor-Key` header and execute `canAccessExam`.
+All routes require authenticated session cookie (`auth_token`) and execute `canAccessExam`.
 
 | Method | Path | Description |
 |---|---|---|
@@ -468,7 +482,65 @@ Professors can test their exam before or after publishing without corrupting stu
   ```
 
 ### 5. Audit Logging & Security
-- **Audit Log Table (`audit_log`)**: All lifecycle mutations (`archive_session`, `unarchive_session`, `hold_session`, `clear_session_data`, `delete_attempt`, `delete_test_attempt`, `clear_unlinked_sessions`, `retention_sweep`) append immutable records with timestamp, actor label (`professor_key`), target attempt ID, client IP, and metadata JSON.
+- **Audit Log Table (`audit_log`)**: All lifecycle mutations (`archive_session`, `unarchive_session`, `hold_session`, `clear_session_data`, `delete_attempt`, `delete_test_attempt`, `clear_unlinked_sessions`, `retention_sweep`, `reset_exam`) append immutable records with timestamp, actor user ID (`actor_user_id`), target identifier, client IP, and metadata JSON (`meta_json`).
 - **DO Purge Protection**: `ExamSessionDO`'s `POST /purge` route is strictly internal to Cloudflare's edge network and is completely unreachable from public worker routing.
+
+---
+
+## Phase 5a: Authentication, Roles, Exam Ownership & Session Binding
+
+Phase 5a replaces shared pre-shared keys and client-supplied student names with a hardened, edge-native authentication and role-based access control system.
+
+### 1. Security & Authentication Layer
+- **Roles**: `student`, `professor`, `admin`.
+- **Password Hashing**: Web Crypto PBKDF2 with SHA-256, 100,000 iterations, and a 16-byte cryptographically secure random salt. Uses constant-time comparison to prevent timing side-channels.
+- **Timing Parity on Unknown Emails**: Failed login attempts on non-existent emails compute a dummy 100k-iteration PBKDF2 hash before returning to ensure uniform execution timing.
+- **Brute-Force & Lockout Protection**: 5 failed login attempts targeting an email address within 15 minutes triggers an immediate `429 Too Many Requests` lockout. A separate loose IP throttle (50 failed logins per 15 minutes per IP) prevents distributed brute-forcing without locking out shared campus networks.
+- **Sessions & Tokens**:
+  - Signed HS256 JWTs using `JWT_SECRET`.
+  - 8-hour expiration (`exp`), subject bound to `users.id`, role claim, and `token_version` (`tv`).
+  - Delivered via an `HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age=28800` cookie named `auth_token` (`Secure` flag added in production/HTTPS).
+  - Instant session revocation via `token_version` incrementing on password changes or administrative deactivations (`POST /api/admin/users/:id/deactivate`).
+- **CSRF & Cross-Site WebSocket Protection**:
+  - `verifyOrigin` enforces that the `Origin` header matches the request host on all mutating requests (`POST`, `PUT`, `DELETE`) and all WebSocket upgrade requests (`Upgrade: websocket`). Violations return `403 Forbidden` and append to `audit_log`.
+- **WebSocket Upgrade Defense**:
+  - Forwarded internal URLs (`http://session.internal/` and `http://hub.internal/ws`) are reconstructed exclusively with verified JWT claims (`userId`, `role`, `tokenVersion`), stripping any client-supplied spoofed parameters.
+- **Exam Reset & Lifecycle Guarantees**:
+  - `POST /api/professor/exams/:id/reset` provides dry-run preview (`dryRun: true`), requires confirmation with exact exam title and `force: true` when attempts exist or results are released, and strictly refuses reset if violation or evidence-hold records exist.
+
+### 2. Multi-Tenant Professor Isolation (`canAccessExam`)
+- Every exam-scoped route verifies ownership:
+  - Accessible if `user.role === 'admin'` OR `exam.created_by === user.id`.
+  - Non-owners receive a strict **`404 Not Found`** (never `403`) to completely prevent exam enumeration.
+  - Legacy exams with `created_by = NULL` are visible exclusively to admins until explicitly claimed via `POST /api/admin/claim-legacy-exams`.
+
+### 3. Student Session Binding & Single Active Connection
+- **Zero Client Name Trust**: Student names and IDs are loaded server-side from the authenticated user record. Client-supplied student names are ignored.
+- **Server-Generated Session IDs**: Session IDs are generated as `sess-${crypto.randomUUID()}` upon attempt creation.
+- **One Live Connection per Session**:
+  - `ExamSessionDO` terminates prior WebSocket connections with close code `4001` (`"session_replaced"`) when a new window or tab connects to the same session.
+  - The client displays a non-dismissible `DuplicateWindowOverlay` explaining that the exam is active in another window.
+
+### 4. In-Exam 401 Re-Authentication & Clean Logout
+- **Graceful Token Expiration Handling**:
+  - If a student's session expires mid-exam during autosave or navigation, a `SessionExpiredModal` appears.
+  - Autosave queues and in-memory answers are preserved intact without data loss.
+  - The student can re-authenticate with their password directly within the modal; upon success, pending answer buffers are immediately flushed.
+- **Mid-Exam Logout**:
+  - Exits fullscreen mode and stops all webcam hardware media tracks.
+  - Cancels behavioral polling intervals.
+  - Leaves the attempt in its current `in_progress` state so it can be resumed later.
+  - Calls `POST /api/auth/logout` and redirects to `/login`.
+
+### 5. CLI Tool for Account Bootstrapping
+Initial administrator and staff accounts can be created securely via the CLI script:
+```bash
+# Interactive hidden password prompt (never logged to history or console):
+npm run user:create -- --role admin --email admin@university.edu --name "System Administrator"
+
+# For remote production D1:
+npm run user:create -- --role admin --email admin@university.edu --name "System Administrator" --remote
+```
+
 
 

@@ -5,17 +5,18 @@
  * Global Question Bank is removed.
  */
 import { Link, useLocation } from 'react-router-dom';
-import { clearProfessorKey } from '../hooks/useProfessorApi';
+import { useAuth } from '../context/AuthContext';
 
 export function ProfessorNav({ onKeyChange }: { onKeyChange?: () => void }) {
   const location = useLocation();
+  const { user, logout } = useAuth();
 
-  function handleLogout() {
-    clearProfessorKey();
+  async function handleLogout() {
+    await logout();
     if (onKeyChange) {
       onKeyChange();
     } else {
-      window.location.reload();
+      window.location.href = '/login';
     }
   }
 
@@ -40,23 +41,39 @@ export function ProfessorNav({ onKeyChange }: { onKeyChange?: () => void }) {
           📋 Exams
         </Link>
       </div>
-      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center' }}>
+      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 14 }}>
+        {user && (
+          <span style={{ fontSize: 13, color: '#94a3b8' }}>
+            <span style={{ color: '#f1f5f9', fontWeight: 600 }}>{user.name}</span>{' '}
+            <span style={{
+              fontSize: 11,
+              padding: '2px 6px',
+              borderRadius: 4,
+              background: user.role === 'admin' ? 'rgba(239,68,68,0.2)' : 'rgba(99,102,241,0.2)',
+              color: user.role === 'admin' ? '#f87171' : '#a5b4fc',
+              textTransform: 'uppercase',
+              fontWeight: 700,
+            }}>
+              {user.role}
+            </span>
+          </span>
+        )}
         <button
-          onClick={handleLogout}
+          onClick={() => void handleLogout()}
           style={{
             background: 'rgba(255,255,255,0.06)',
-            color: '#94a3b8',
-            border: '1px solid rgba(255,255,255,0.1)',
+            color: '#f87171',
+            border: '1px solid rgba(239,68,68,0.3)',
             borderRadius: 6,
-            padding: '4px 10px',
+            padding: '4px 12px',
             fontSize: 12,
             fontWeight: 500,
             cursor: 'pointer',
             transition: 'all 0.15s',
           }}
-          title="Change or clear the professor secret key"
+          title="Sign out of your account"
         >
-          🔑 Change Key
+          🚪 Sign Out
         </button>
       </div>
     </nav>

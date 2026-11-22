@@ -663,6 +663,12 @@ export function ExamEditorPage() {
   const [previewMode, setPreviewMode] = useState<'questions_only' | 'full'>('questions_only');
   const [previewLoading, setPreviewLoading] = useState(false);
 
+  // Reset exam states (Phase 5a Requirement 2)
+  const [showResetModal, setShowResetModal] = useState(false);
+  const [resetCounts, setResetCounts] = useState<{ attemptsCount: number; answersCount: number } | null>(null);
+  const [typedResetTitle, setTypedResetTitle] = useState('');
+  const [resetting, setResetting] = useState(false);
+
   // Settings form state
   const [settingsForm, setSettingsForm] = useState({
     title: '',
@@ -817,6 +823,56 @@ export function ExamEditorPage() {
     }
   }
 
+  async function handleOpenResetModal() {
+    if (!exam) return;
+    setError('');
+    try {
+      const res = await fetch(`/api/professor/exams/${exam.id}/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dryRun: true }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as any).error || 'Failed to fetch reset preview');
+      }
+      const data = (await res.json()) as { wouldDeleteAttempts: number; wouldDeleteAnswers: number };
+      setResetCounts({
+        attemptsCount: data.wouldDeleteAttempts ?? 0,
+        answersCount: data.wouldDeleteAnswers ?? 0,
+      });
+      setTypedResetTitle('');
+      setShowResetModal(true);
+    } catch (e: any) {
+      setError(e.message || 'Failed to initiate exam reset preview');
+    }
+  }
+
+  async function handleConfirmReset() {
+    if (!exam) return;
+    setResetting(true);
+    setError('');
+    try {
+      const res = await fetch(`/api/professor/exams/${exam.id}/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: true, confirmTitle: typedResetTitle }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as any).error || 'Reset failed');
+      }
+      const data = (await res.json()) as any;
+      setShowResetModal(false);
+      setExam(data.exam);
+      setSuccessMsg('Exam has been successfully reset to draft. Clean attempts and answers were purged.');
+    } catch (e: any) {
+      setError(e.message || 'Failed to reset exam');
+    } finally {
+      setResetting(false);
+    }
+  }
+
   async function handleSaveSettings(e: React.FormEvent) {
     e.preventDefault();
     if (!exam) return;
@@ -949,6 +1005,27 @@ export function ExamEditorPage() {
             <span>👁️</span>
             <span>Preview Exam</span>
           </button>
+
+          {!isDraft && (
+            <button
+              type="button"
+              style={{
+                ...btnSecondary,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                background: 'rgba(239, 68, 68, 0.12)',
+                borderColor: 'rgba(239, 68, 68, 0.35)',
+                color: '#f87171',
+              }}
+              onClick={() => void handleOpenResetModal()}
+              id="reset-exam-btn"
+              title="Reset exam to draft state"
+            >
+              <span>🔄</span>
+              <span>Reset to Draft</span>
+            </button>
+          )}
 
           {isDraft && (
             <button
@@ -1621,6 +1698,75 @@ export function ExamEditorPage() {
                 onClick={() => void handleDeleteQuestion(deleteQTarget.id)}
               >
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reset Exam Confirmation Modal (Phase 5a Requirement 2) */}
+      {showResetModal && resetCounts && exam && (
+        <div style={overlay}>
+          <div style={{ ...confirmModal, maxWidth: 460 }}>
+            <h3 style={{ margin: '0 0 12px', color: '#f87171', fontSize: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>⚠️</span> Reset Exam to Draft
+            </h3>
+            <p style={{ color: '#cbd5e1', fontSize: 13, lineHeight: 1.5, margin: '0 0 16px' }}>
+              Resetting this exam will return it to draft state, permitting question and settings edits.
+            </p>
+            <div style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', borderRadius: 8, padding: '12px 14px', marginBottom: 16 }}>
+              <div style={{ fontSize: 13, color: '#fca5a5', fontWeight: 600, marginBottom: 6 }}>
+                Items that will be deleted:
+              </div>
+              <ul style={{ margin: 0, paddingLeft: 18, color: '#fecaca', fontSize: 13 }}>
+                <li><strong>{resetCounts.attemptsCount}</strong> clean attempt(s)</li>
+                <li><strong>{resetCounts.answersCount}</strong> answer record(s)</li>
+              </ul>
+              <div style={{ fontSize: 11, color: '#f87171', marginTop: 8 }}>
+                * Attempts with active violations or evidence holds cannot be deleted under Phase 4c-2b rules.
+              </div>
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: 'block', color: '#94a3b8', fontSize: 12, marginBottom: 6 }}>
+                To confirm, type the exact exam title: <strong style={{ color: '#f1f5f9' }}>{exam.title}</strong>
+              </label>
+              <input
+                type="text"
+                value={typedResetTitle}
+                onChange={(e) => setTypedResetTitle(e.target.value)}
+                placeholder={exam.title}
+                style={{
+                  width: '100%',
+                  background: '#1e293b',
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: 6,
+                  padding: '8px 12px',
+                  color: '#f8fafc',
+                  fontSize: 13,
+                  boxSizing: 'border-box',
+                }}
+              />
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                style={btnSecondary}
+                onClick={() => setShowResetModal(false)}
+                disabled={resetting}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                style={{
+                  ...btnPrimary,
+                  background: typedResetTitle.trim().toLowerCase() === exam.title.trim().toLowerCase() ? '#dc2626' : 'rgba(239,68,68,0.3)',
+                  cursor: typedResetTitle.trim().toLowerCase() === exam.title.trim().toLowerCase() ? 'pointer' : 'not-allowed',
+                }}
+                onClick={() => void handleConfirmReset()}
+                disabled={resetting || typedResetTitle.trim().toLowerCase() !== exam.title.trim().toLowerCase()}
+              >
+                {resetting ? 'Resetting…' : 'Confirm Reset'}
               </button>
             </div>
           </div>

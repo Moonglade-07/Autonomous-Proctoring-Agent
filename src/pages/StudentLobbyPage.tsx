@@ -15,7 +15,8 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
-import { useParams, useSearchParams, useNavigate, Link } from 'react-router-dom';
+import { useParams, useNavigate, Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 import type { StudentExamSummary } from '../types';
 
 interface SystemCheck {
@@ -28,11 +29,9 @@ interface SystemCheck {
 
 export function StudentLobbyPage() {
   const { examId } = useParams<{ examId: string }>();
-  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-
-  const studentName =
-    searchParams.get('name') || sessionStorage.getItem('apa_student_name') || '';
+  const { user } = useAuth();
+  const studentName = user?.name || '';
 
   const [exam, setExam] = useState<StudentExamSummary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -239,7 +238,7 @@ export function StudentLobbyPage() {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
     }
-    navigate(`/exam?exam=${encodeURIComponent(exam.id)}&name=${encodeURIComponent(studentName)}`);
+    navigate(`/student/exam/${encodeURIComponent(exam.id)}`);
   }
 
   function formatCountdown(secs: number): string {

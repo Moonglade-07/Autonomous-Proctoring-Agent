@@ -14,8 +14,75 @@
 
 import { describe, it, expect } from 'vitest';
 import { gradeAttempt, toStudentQuestion, type QuestionForGrading } from '../worker/utils/questionGrading';
-import { handleGradingApi, runAutoEndSweep, type GradingEnv } from '../worker/api/grading';
-import { handleStudentApi } from '../worker/api/student';
+import { handleGradingApi as rawHandleGradingApi, runAutoEndSweep, type GradingEnv } from '../worker/api/grading';
+import { handleStudentApi as rawHandleStudentApi } from '../worker/api/student';
+import { signJwt } from '../worker/auth/jwt';
+import { serializeAuthCookie } from '../worker/auth/cookies';
+import type { User } from '../worker/auth/types';
+
+const TEST_SECRET = 'test-secret-key-for-jwt-signing-minimum-32-chars-long';
+
+const mockProfUser: User = {
+  id: 'prof-test',
+  email: 'prof@test.com',
+  name: 'Professor Test',
+  role: 'professor',
+  password_hash: '',
+  password_salt: '',
+  student_id: null,
+  department: null,
+  active: 1,
+  token_version: 0,
+  created_at: new Date().toISOString(),
+  last_login_at: null,
+};
+
+const mockStudentUser: User = {
+  id: 'student-test',
+  email: 'student@test.com',
+  name: 'Student Test',
+  role: 'student',
+  password_hash: '',
+  password_salt: '',
+  student_id: 'S1',
+  department: null,
+  active: 1,
+  token_version: 0,
+  created_at: new Date().toISOString(),
+  last_login_at: null,
+};
+
+const handleGradingApi = (
+  req: Request,
+  env: any,
+  subPath: string,
+  method: string,
+  user: User = mockProfUser,
+) => {
+  const finalEnv = { JWT_SECRET: TEST_SECRET, ...env };
+  return rawHandleGradingApi(req, finalEnv, subPath, method, user);
+};
+
+const handleStudentApi = async (req: Request, env: any) => {
+  const token = await signJwt({ sub: 'student-test', role: 'student', tv: 0 }, TEST_SECRET);
+  const cookie = serializeAuthCookie(token);
+  const headers = new Headers(req.headers);
+  if (!headers.has('Cookie')) {
+    headers.set('Cookie', cookie);
+  }
+  if (!headers.has('Origin') && req.method !== 'GET' && req.method !== 'HEAD') {
+    headers.set('Origin', 'http://localhost');
+  }
+  const proxiedReq = new Request(req.url, {
+    method: req.method,
+    headers,
+    body: req.body,
+    // @ts-ignore
+    duplex: 'half',
+  });
+  const finalEnv = { JWT_SECRET: TEST_SECRET, ...env };
+  return rawHandleStudentApi(proxiedReq, finalEnv);
+};
 
 // ─── Mock D1 Database Helper ─────────────────────────────────────────────────
 
@@ -39,17 +106,22 @@ function createMockDb(config: MockDbConfig) {
         return makeStatement(query, args);
       },
       async first<T = Record<string, unknown>>(): Promise<T | null> {
+        // Users lookup (Phase 5a requireAuth)
+        if (query.includes('FROM users WHERE id = ?')) {
+          const id = String(boundArgs[0] ?? '');
+          return (id === 'prof-test' ? mockProfUser : mockStudentUser) as T;
+        }
         // Rate limit check
         if (query.includes('FROM grading_rate_limits')) {
           return { count: config.rateLimitCount ?? 0 } as T;
         }
-        // Exam lookup
+        // Exam lookup (default created_by = prof-test for ownership checks)
         if (query.includes('FROM exams WHERE id = ?') || query.includes('FROM exams WHERE join_code = ?')) {
-          return (config.exam ?? null) as T | null;
+          return (config.exam ? { created_by: 'prof-test', ...config.exam } : null) as T | null;
         }
-        // Attempt lookup
+        // Attempt lookup (default user_id = student-test)
         if (query.includes('FROM attempts WHERE id = ?') || query.includes('FROM attempts WHERE exam_id = ?')) {
-          return (config.attempt ?? null) as T | null;
+          return (config.attempt ? { user_id: 'student-test', ...config.attempt } : null) as T | null;
         }
         // Snapshot lookup
         if (query.includes('FROM exam_questions') && query.includes('snapshot_json')) {
@@ -72,7 +144,9 @@ function createMockDb(config: MockDbConfig) {
       },
       async all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
         if (query.includes('FROM attempts WHERE a.exam_id = ?') || query.includes('FROM attempts WHERE exam_id = ?')) {
-          return { results: (config.attemptsList ?? [config.attempt].filter(Boolean)) as T[] };
+          const raw = config.attemptsList ?? [config.attempt].filter(Boolean);
+          const mapped = raw.map((a: any) => ({ user_id: 'student-test', ...a }));
+          return { results: mapped as T[] };
         }
         if (query.includes('FROM exam_questions')) {
           return {
@@ -177,11 +251,11 @@ describe('Phase 4c-2a: Grade PUT Validation & Overrides', () => {
 
     const req = new Request('http://localhost/api/professor/attempts/att-1/answers/q-1/grade', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'X-Professor-Key': 'key' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ points: 2 }),
     });
 
-    const res = await handleGradingApi(req, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/attempts/att-1/answers/q-1/grade', 'PUT');
+    const res = await handleGradingApi(req, { DB: mockDb }, '/attempts/att-1/answers/q-1/grade', 'PUT');
     expect(res?.status).toBe(409);
     const body = (await res?.json()) as { error: string };
     expect(body.error).toContain('not in a gradable state');
@@ -199,19 +273,19 @@ describe('Phase 4c-2a: Grade PUT Validation & Overrides', () => {
     // 1. Points greater than max
     const req1 = new Request('http://localhost/api/professor/attempts/att-1/answers/q-1/grade', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'X-Professor-Key': 'key' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ points: 6 }),
     });
-    const res1 = await handleGradingApi(req1, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/attempts/att-1/answers/q-1/grade', 'PUT');
+    const res1 = await handleGradingApi(req1, { DB: mockDb }, '/attempts/att-1/answers/q-1/grade', 'PUT');
     expect(res1?.status).toBe(400);
 
     // 2. Step not 0.25 (e.g. 2.13)
     const req2 = new Request('http://localhost/api/professor/attempts/att-1/answers/q-1/grade', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'X-Professor-Key': 'key' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ points: 2.13 }),
     });
-    const res2 = await handleGradingApi(req2, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/attempts/att-1/answers/q-1/grade', 'PUT');
+    const res2 = await handleGradingApi(req2, { DB: mockDb }, '/attempts/att-1/answers/q-1/grade', 'PUT');
     expect(res2?.status).toBe(400);
     const body2 = (await res2?.json()) as { error: string };
     expect(body2.error).toContain('multiple of 0.25');
@@ -228,10 +302,10 @@ describe('Phase 4c-2a: Grade PUT Validation & Overrides', () => {
 
     const req = new Request('http://localhost/api/professor/attempts/att-1/answers/q-mcq/grade', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'X-Professor-Key': 'key' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ points: 2 }),
     });
-    const res = await handleGradingApi(req, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/attempts/att-1/answers/q-mcq/grade', 'PUT');
+    const res = await handleGradingApi(req, { DB: mockDb }, '/attempts/att-1/answers/q-mcq/grade', 'PUT');
     expect(res?.status).toBe(400);
     const body = (await res?.json()) as { error: string };
     expect(body.error).toContain('auto only');
@@ -250,11 +324,11 @@ describe('Phase 4c-2a: Grade PUT Validation & Overrides', () => {
 
     const req = new Request('http://localhost/api/professor/attempts/att-1/answers/q-sa/grade', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'X-Professor-Key': 'key' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ points: 3.5, comment: 'Partial credit for close answer' }),
     });
 
-    const res = await handleGradingApi(req, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/attempts/att-1/answers/q-sa/grade', 'PUT');
+    const res = await handleGradingApi(req, { DB: mockDb }, '/attempts/att-1/answers/q-sa/grade', 'PUT');
     expect(res?.status).toBe(200);
     const body = (await res?.json()) as { success: boolean; awarded_points: number; fully_graded: boolean };
     expect(body.success).toBe(true);
@@ -281,11 +355,9 @@ describe('Phase 4c-2a: Blind Grading Mode', () => {
       ],
     });
 
-    const req = new Request('http://localhost/api/professor/exams/exam-1/grading/questions/q-essay?blind=1', {
-      headers: { 'X-Professor-Key': 'key' },
-    });
+    const req = new Request('http://localhost/api/professor/exams/exam-1/grading/questions/q-essay?blind=1');
 
-    const res = await handleGradingApi(req, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/exams/exam-1/grading/questions/q-essay', 'GET');
+    const res = await handleGradingApi(req, { DB: mockDb }, '/exams/exam-1/grading/questions/q-essay', 'GET');
     expect(res?.status).toBe(200);
     const body = (await res?.json()) as { question: Record<string, unknown>; answers: Array<Record<string, unknown>> };
 
@@ -377,14 +449,14 @@ describe('Phase 4c-2a: Results Release Gating & Answer Leak Protection', () => {
     expect(data.attempt.status).toBe('submitted');
   });
 
-  it('GET /api/student/exams/:id/attempt returns 400 when name is missing', async () => {
+  it('GET /api/student/exams/:id/attempt returns 401 when unauthenticated', async () => {
     const mockDb = createMockDb({
       exam: { id: 'exam-1', title: 'Test Exam' },
     });
 
     const req = new Request('http://localhost/api/student/exams/exam-1/attempt');
-    const res = await handleStudentApi(req, { DB: mockDb });
-    expect(res.status).toBe(400);
+    const res = await rawHandleStudentApi(req, { DB: mockDb, JWT_SECRET: TEST_SECRET });
+    expect(res.status).toBe(401);
   });
 
   it('GET /api/student/attempts/:id/result returns 403 if attempt is still in progress', async () => {
@@ -409,10 +481,9 @@ describe('Phase 4c-2a: AI Suggest-Grade Security & Clamping', () => {
 
     const req = new Request('http://localhost/api/professor/attempts/att-1/answers/q-1/suggest-grade', {
       method: 'POST',
-      headers: { 'X-Professor-Key': 'key' },
     });
 
-    const res = await handleGradingApi(req, { DB: mockDb, PROFESSOR_KEY: 'key' }, '/attempts/att-1/answers/q-1/suggest-grade', 'POST');
+    const res = await handleGradingApi(req, { DB: mockDb }, '/attempts/att-1/answers/q-1/suggest-grade', 'POST');
     expect(res?.status).toBe(429);
     const body = (await res?.json()) as { error: string };
     expect(body.error).toContain('Rate limit exceeded');
@@ -437,12 +508,11 @@ describe('Phase 4c-2a: AI Suggest-Grade Security & Clamping', () => {
 
     const req = new Request('http://localhost/api/professor/attempts/att-1/answers/q-1/suggest-grade', {
       method: 'POST',
-      headers: { 'X-Professor-Key': 'key' },
     });
 
     const res = await handleGradingApi(
       req,
-      { DB: mockDb, PROFESSOR_KEY: 'key', AI: mockAi as unknown as Ai },
+      { DB: mockDb, AI: mockAi as unknown as Ai },
       '/attempts/att-1/answers/q-1/suggest-grade',
       'POST',
     );

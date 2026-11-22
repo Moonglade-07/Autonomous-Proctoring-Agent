@@ -22,7 +22,8 @@
  */
 
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useParams, useSearchParams, Link } from 'react-router-dom';
+import { useParams, useSearchParams, Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 import { WebcamPreview } from '../components/WebcamPreview';
 import { RiskIndicator } from '../components/RiskIndicator';
 import { EventLog } from '../components/EventLog';
@@ -43,19 +44,6 @@ import type {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function getSessionId(examId: string, name: string): string {
-  if (typeof window === 'undefined') return 'session-ssr';
-  const sp = new URLSearchParams(window.location.search);
-  const fromUrl = sp.get('sessionId') || sp.get('session');
-  if (fromUrl) return fromUrl;
-  const storageKey = `apa_session_${examId}_${name}`;
-  const stored = sessionStorage.getItem(storageKey);
-  if (stored) return stored;
-  const created = `session-${Math.random().toString(36).slice(2, 10)}`;
-  sessionStorage.setItem(storageKey, created);
-  return created;
-}
-
 function formatTime(secs: number): string {
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
@@ -68,6 +56,106 @@ function difficultyBadge(d?: string): string {
   if (d === 'easy') return 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30';
   if (d === 'hard') return 'text-red-400 bg-red-500/10 border-red-500/30';
   return 'text-amber-400 bg-amber-500/10 border-amber-500/30';
+}
+
+function SessionExpiredModal({
+  email,
+  onReauth,
+}: {
+  email: string;
+  onReauth: (password: string) => Promise<boolean>;
+}) {
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!password) return;
+    setSubmitting(true);
+    setError('');
+    try {
+      const ok = await onReauth(password);
+      if (!ok) {
+        setError('Incorrect password. Please try again.');
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Re-authentication failed');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+      <div className="max-w-md w-full bg-gray-900 border border-amber-500/30 rounded-2xl p-7 shadow-2xl">
+        <div className="text-4xl text-center mb-3">🔒</div>
+        <h3 className="text-base font-bold text-white text-center mb-2">Session Expired</h3>
+        <p className="text-xs text-gray-400 text-center mb-5">
+          Your session timed out. Re-authenticate to save your answers. <strong>Your work in progress is preserved in memory.</strong>
+        </p>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="text-[11px] text-gray-400 font-semibold uppercase tracking-wider block mb-1">
+              Account Email
+            </label>
+            <input
+              type="email"
+              value={email}
+              disabled
+              className="w-full bg-gray-800/60 border border-white/5 rounded-xl px-4 py-2.5 text-sm text-gray-400 cursor-not-allowed"
+            />
+          </div>
+          <div>
+            <label className="text-[11px] text-gray-400 font-semibold uppercase tracking-wider block mb-1">
+              Password
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter your password"
+              autoFocus
+              required
+              className="w-full bg-gray-800 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-amber-500/60 transition-colors"
+            />
+          </div>
+          {error && (
+            <p className="text-xs text-red-400 bg-red-950/40 border border-red-500/30 rounded-lg p-2.5">
+              ⚠️ {error}
+            </p>
+          )}
+          <button
+            type="submit"
+            disabled={submitting || !password}
+            className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white text-sm font-semibold transition-all shadow-lg shadow-amber-900/30 cursor-pointer disabled:opacity-40"
+          >
+            {submitting ? 'Authenticating…' : 'Re-authenticate & Save Answers'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function DuplicateWindowOverlay() {
+  return (
+    <div className="fixed inset-0 z-[80] bg-black/90 backdrop-blur-lg flex items-center justify-center p-4">
+      <div className="max-w-md w-full bg-gray-900 border border-red-500/40 rounded-2xl p-7 shadow-2xl text-center">
+        <div className="text-5xl mb-4">🚫</div>
+        <h3 className="text-lg font-bold text-white mb-2">Exam Open in Another Window</h3>
+        <p className="text-sm text-gray-300 mb-6 leading-relaxed">
+          This exam session has been opened in another browser tab or window. To maintain academic integrity, only one live window is permitted at a time.
+        </p>
+        <Link
+          to="/student"
+          className="inline-block w-full py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white text-sm font-semibold transition-all shadow-lg shadow-red-900/40"
+        >
+          Return to My Exams
+        </Link>
+      </div>
+    </div>
+  );
 }
 
 // ─── Phase 3b: Intervention Modals & Overlays ─────────────────────────────────
@@ -654,15 +742,22 @@ export function ExamPage() {
   const examId =
     params.examId || searchParams.get('exam') || searchParams.get('examId') || 'exam-1';
 
+  const { user, login, logout } = useAuth();
+  const navigate = useNavigate();
+
   const [studentName, setStudentName] = useState<string>(() => {
-    return (
-      searchParams.get('name') ||
-      sessionStorage.getItem('apa_student_name') ||
-      `Student-${Math.random().toString(36).slice(2, 6)}`
-    );
+    return user?.name || searchParams.get('name') || 'Student';
   });
 
-  const sessionId = getSessionId(examId, studentName);
+  const [sessionId, setSessionId] = useState<string>(() => {
+    return searchParams.get('sessionId') || searchParams.get('session') || '';
+  });
+
+  useEffect(() => {
+    if (user?.name) {
+      setStudentName(user.name);
+    }
+  }, [user]);
 
   // ── Exam & Question State ──────────────────────────────────────────────────
   const [examMeta, setExamMeta] = useState<StudentExamSummary | null>(null);
@@ -674,6 +769,7 @@ export function ExamPage() {
   const [secondsRemaining, setSecondsRemaining] = useState(0);
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [activeTab, setActiveTab] = useState<'questions' | 'telemetry'>('questions');
+  const [showSessionExpiredModal, setShowSessionExpiredModal] = useState(false);
 
   // Submission & Result state
   const [isSubmitted, setIsSubmitted] = useState(false);
@@ -715,6 +811,10 @@ export function ExamPage() {
   const syncServerTime = useCallback(async (attemptId: string) => {
     try {
       const r = await fetch(`/api/student/attempts/${attemptId}/time`);
+      if (r.status === 401) {
+        setShowSessionExpiredModal(true);
+        return;
+      }
       const ct = r.headers.get('content-type');
       if (r.ok && ct && ct.includes('application/json')) {
         const d = (await r.json()) as {
@@ -825,7 +925,7 @@ export function ExamPage() {
     [loadResult, syncServerTime],
   );
 
-  const { sendEvent, status, sendRaw } = useWebSocket({
+  const { sendEvent, status, sendRaw, closeReason } = useWebSocket({
     sessionId,
     examId,
     studentName,
@@ -927,6 +1027,11 @@ export function ExamPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ answers: body }),
       });
+      if (r.status === 401) {
+        setShowSessionExpiredModal(true);
+        setAutoSaveStatus('error');
+        return;
+      }
       if (r.status === 410) {
         // Deadline passed — trigger auto-submit
         await handleAutoSubmit();
@@ -988,13 +1093,12 @@ export function ExamPage() {
 
   const handleIdentityConfirmed = useCallback(async () => {
     setShowIdentityModal(false);
-    sessionStorage.setItem('apa_student_name', studentName);
 
     try {
       const res = await fetch(`/api/student/exams/${examId}/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: studentName, session_id: sessionId }),
+        body: JSON.stringify({}),
       });
 
       const ct = res.headers.get('content-type');
@@ -1019,6 +1123,12 @@ export function ExamPage() {
       };
 
       setAttempt(data.attempt);
+      if (data.attempt.session_id) {
+        setSessionId(data.attempt.session_id);
+      }
+      if (data.attempt.student_name) {
+        setStudentName(data.attempt.student_name);
+      }
       setQuestions(data.questions);
       setSecondsRemaining(data.seconds_remaining);
       setIsPaused(!!data.attempt.paused_at);
@@ -1059,7 +1169,47 @@ export function ExamPage() {
     } catch (e) {
       setLoadError((e as Error).message);
     }
-  }, [examId, studentName, sessionId, startBehavioral, sendEvent, loadResult, isQuestionsOnly]);
+  }, [examId, studentName, startBehavioral, sendEvent, loadResult, isQuestionsOnly]);
+
+  const handleReauth = useCallback(
+    async (password: string): Promise<boolean> => {
+      if (!user?.email) return false;
+      try {
+        await login(user.email, password);
+        setShowSessionExpiredModal(false);
+        void doAutosave();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [user?.email, login, doAutosave],
+  );
+
+  const handleMidExamLogout = useCallback(async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+    } catch {}
+
+    try {
+      if (videoRef.current?.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach((t) => t.stop());
+        videoRef.current.srcObject = null;
+      }
+    } catch {}
+
+    try {
+      stopMonitoringRef.current?.();
+    } catch {}
+
+    try {
+      await logout();
+    } catch {}
+    navigate('/login');
+  }, [logout, navigate]);
 
   // ── Exam Start Flow ────────────────────────────────────────────────────────
   const handleStartExam = useCallback(() => {
@@ -1297,6 +1447,10 @@ export function ExamPage() {
   return (
     <div className="min-h-screen bg-gray-950 text-white font-sans flex flex-col">
       {/* ── Interventions & Modals ────────────────────────────────────────── */}
+      {closeReason === 'This exam is open in another window' && <DuplicateWindowOverlay />}
+      {showSessionExpiredModal && user?.email && (
+        <SessionExpiredModal email={user.email} onReauth={handleReauth} />
+      )}
       {isPaused && !isSubmitted && <PauseOverlay message={pauseMessage} />}
       {pendingWarn && !isSubmitted && (
         <WarnModal intervention={pendingWarn} onAcknowledge={handleWarnAcknowledge} />
@@ -1370,6 +1524,15 @@ export function ExamPage() {
 
             {attempt && <ExamTimer secondsRemaining={secondsRemaining} isPaused={isPaused} />}
             <WSStatusDot status={status} />
+
+            <button
+              type="button"
+              onClick={handleMidExamLogout}
+              title="Sign out of your account"
+              className="px-2.5 py-1.5 rounded-xl border border-white/10 hover:bg-white/5 text-gray-400 hover:text-white text-xs font-medium transition-all"
+            >
+              Sign Out
+            </button>
 
             {attempt && !isSubmitted && (
               <button
@@ -1626,24 +1789,22 @@ export function ExamPage() {
                   </div>
                 </div>
 
-                <div className="text-left mb-6">
-                  <label className="text-[11px] text-gray-400 font-semibold uppercase tracking-wider block mb-1.5">
-                    Your Name (Student ID)
-                  </label>
-                  <input
-                    id="student-name-input"
-                    type="text"
-                    value={studentName}
-                    onChange={(e) => setStudentName(e.target.value)}
-                    placeholder="Enter your name"
-                    className="w-full bg-gray-800 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-violet-500/60 transition-colors"
-                  />
+                <div className="text-left mb-6 p-3.5 bg-gray-800/80 border border-white/10 rounded-xl">
+                  <div className="text-[11px] text-gray-400 font-semibold uppercase tracking-wider mb-1">
+                    Student Account
+                  </div>
+                  <div className="text-sm font-semibold text-white">
+                    {user?.name || studentName}
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    {user?.email} {user?.student_id ? `· ID: ${user.student_id}` : ''}
+                  </div>
                 </div>
 
                 <button
                   id="start-exam-btn"
                   onClick={handleStartExam}
-                  disabled={isQuestionsOnly ? false : (status !== 'open' || faceState.modelState === 'loading')}
+                  disabled={isQuestionsOnly ? false : (faceState.modelState === 'loading')}
                   className="w-full py-3.5 px-6 rounded-xl text-sm font-bold bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white shadow-lg shadow-violet-900/40 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed active:scale-[0.98]"
                 >
                   {isQuestionsOnly
@@ -1652,12 +1813,6 @@ export function ExamPage() {
                     ? 'Loading Face AI Models…'
                     : '📷 Verify Identity & Begin Exam'}
                 </button>
-
-                {!isQuestionsOnly && status !== 'open' && (
-                  <p className="text-xs text-amber-500 mt-2 animate-pulse">
-                    Connecting to proctoring hub…
-                  </p>
-                )}
               </div>
             </div>
           ) : (

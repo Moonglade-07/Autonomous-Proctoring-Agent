@@ -20,10 +20,44 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { handleSessionsApi, runRetentionSweep } from '../worker/api/sessions';
-import { handleGradingApi } from '../worker/api/grading';
+import { handleSessionsApi as rawHandleSessionsApi, runRetentionSweep } from '../worker/api/sessions';
+import { handleGradingApi as rawHandleGradingApi } from '../worker/api/grading';
 import { ExamSessionDO } from '../worker/ExamSessionDO';
 import worker from '../worker/index';
+import type { User } from '../worker/auth/types';
+
+const mockProfUser: User = {
+  id: 'prof-test',
+  email: 'prof@test.com',
+  name: 'Professor Test',
+  role: 'professor',
+  password_hash: '',
+  password_salt: '',
+  student_id: null,
+  department: null,
+  active: 1,
+  token_version: 0,
+  created_at: new Date().toISOString(),
+  last_login_at: null,
+};
+
+const handleSessionsApi = (
+  req: Request,
+  env: any,
+  subPath: string,
+  method: string,
+  examId: string,
+  user: User = mockProfUser,
+) => rawHandleSessionsApi(req, env, subPath, method, examId, user);
+
+const handleGradingApi = (
+  req: Request,
+  env: any,
+  subPath: string,
+  method: string,
+  _examId?: string,
+  user: User = mockProfUser,
+) => rawHandleGradingApi(req, env, subPath, method, user);
 
 // ─── Mock D1 Database Helper ─────────────────────────────────────────────────
 
@@ -50,7 +84,8 @@ function createMockDb(config: MockDbConfig) {
       },
       async first<T = Record<string, unknown>>(): Promise<T | null> {
         if (query.includes('FROM exams WHERE id = ?')) {
-          return (config.exam ?? null) as T | null;
+          if (config.exam === null) return null;
+          return { id: 'exam-1', created_by: 'prof-test', ...config.exam } as T | null;
         }
         if (query.includes('FROM attempts WHERE id = ?')) {
           const id = boundArgs[0];
@@ -227,7 +262,6 @@ function createMockEnv(db: ReturnType<typeof createMockDb>) {
 
   return {
     DB: db as unknown as D1Database,
-    PROFESSOR_KEY: 'test-prof-key',
     EXAM_SESSION: mockSessionDO as unknown as DurableObjectNamespace,
     EXAM_HUB: mockHubDO as unknown as DurableObjectNamespace,
     doPurges,
@@ -805,7 +839,7 @@ describe('Phase 4c-2b: Session Lifecycle, Retention & Deletion Rules', () => {
       const dailyController = {
         cron: '0 3 * * *',
         scheduledTime: Date.now(),
-        noRetry: () => {},
+        noRetry: () => { },
       } as ScheduledController;
 
       // Spy on scheduled
@@ -814,7 +848,10 @@ describe('Phase 4c-2b: Session Lifecycle, Retention & Deletion Rules', () => {
     });
 
     it('/purge endpoint is not exposed on public worker routes', async () => {
-      const req = new Request('http://localhost/purge', { method: 'POST' });
+      const req = new Request('http://localhost/purge', {
+        method: 'POST',
+        headers: { Origin: 'http://localhost' },
+      });
       const env = {
         ASSETS: {
           fetch: async () => new Response('Not found from static assets', { status: 404 }),
@@ -898,9 +935,9 @@ describe('Phase 4c-2b: Session Lifecycle, Retention & Deletion Rules', () => {
       const mockDOState = {
         storage: {
           get: async () => null,
-          put: async () => {},
-          delete: async () => {},
-          deleteAll: async () => {},
+          put: async () => { },
+          delete: async () => { },
+          deleteAll: async () => { },
         },
       } as unknown as DurableObjectState;
 
@@ -997,9 +1034,9 @@ describe('Phase 4c-2b: Session Lifecycle, Retention & Deletion Rules', () => {
       const mockDOState = {
         storage: {
           get: async () => null,
-          put: async () => {},
-          delete: async () => {},
-          deleteAll: async () => {},
+          put: async () => { },
+          delete: async () => { },
+          deleteAll: async () => { },
         },
       } as unknown as DurableObjectState;
 

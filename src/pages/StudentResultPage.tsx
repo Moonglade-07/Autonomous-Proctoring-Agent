@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useParams, useSearchParams, Link } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import type { Attempt, QuestionType } from '../types';
 
 interface QuestionWithAnswer {
@@ -82,15 +82,6 @@ function formatCorrectAnswer(rawAns?: string | null): string {
 
 export function StudentResultPage() {
   const { examId } = useParams<{ examId: string }>();
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  const [studentName, setStudentName] = useState<string>(() => {
-    return (
-      searchParams.get('name') ||
-      (typeof window !== 'undefined' ? sessionStorage.getItem('apa_student_name') || '' : '')
-    );
-  });
-  const [nameInput, setNameInput] = useState<string>(studentName);
 
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -99,14 +90,9 @@ export function StudentResultPage() {
   const [attempt, setAttempt] = useState<Attempt | null>(null);
   const [resultData, setResultData] = useState<ResultData | null>(null);
 
-  const loadData = useCallback(async (nameToUse: string) => {
+  const loadData = useCallback(async () => {
     if (!examId) {
       setError('Exam ID is missing');
-      setLoading(false);
-      return;
-    }
-
-    if (!nameToUse.trim()) {
       setLoading(false);
       return;
     }
@@ -117,9 +103,7 @@ export function StudentResultPage() {
     try {
       // 1. Fetch attempt for this exam and student
       const attemptRes = await fetch(
-        `/api/student/exams/${encodeURIComponent(examId)}/attempt?name=${encodeURIComponent(
-          nameToUse.trim(),
-        )}`,
+        `/api/student/exams/${encodeURIComponent(examId)}/attempt`,
       );
 
       if (!attemptRes.ok) {
@@ -173,21 +157,8 @@ export function StudentResultPage() {
   }, [examId]);
 
   useEffect(() => {
-    if (studentName.trim()) {
-      sessionStorage.setItem('apa_student_name', studentName.trim());
-      loadData(studentName.trim());
-    } else {
-      setLoading(false);
-    }
-  }, [studentName, loadData]);
-
-  const handleNameSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (nameInput.trim()) {
-      setStudentName(nameInput.trim());
-      setSearchParams({ name: nameInput.trim() });
-    }
-  };
+    void loadData();
+  }, [loadData]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-white pb-16">
@@ -233,7 +204,7 @@ export function StudentResultPage() {
             <div className="flex items-center justify-center gap-3">
               <button
                 type="button"
-                onClick={() => loadData(studentName)}
+                onClick={() => void loadData()}
                 className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white transition-colors"
               >
                 Try Again
@@ -248,52 +219,13 @@ export function StudentResultPage() {
           </div>
         )}
 
-        {/* Name Input State (if accessed without name query or session) */}
-        {!loading && !error && !studentName.trim() && (
-          <div className="bg-gray-900 border border-white/10 rounded-2xl p-8 max-w-md mx-auto text-center shadow-xl">
-            <div className="text-4xl mb-3">👤</div>
-            <h2 className="text-base font-bold text-white mb-2">Student Verification</h2>
-            <p className="text-xs text-gray-400 mb-6">
-              Enter your student name or ID to view your exam submission.
-            </p>
-            <form onSubmit={handleNameSubmit} className="space-y-4 text-left">
-              <div>
-                <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block mb-1.5">
-                  Your Full Name / Student ID
-                </label>
-                <input
-                  type="text"
-                  value={nameInput}
-                  onChange={(e) => setNameInput(e.target.value)}
-                  placeholder="e.g. Jane Doe"
-                  required
-                  className="w-full bg-gray-800 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors"
-                />
-              </div>
-              <button
-                type="submit"
-                className="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white transition-colors"
-              >
-                View Result →
-              </button>
-            </form>
-            <div className="mt-6 pt-4 border-t border-white/5">
-              <Link to="/student" className="text-xs text-gray-400 hover:text-white transition-colors">
-                ← Back to Student Portal
-              </Link>
-            </div>
-          </div>
-        )}
-
         {/* No Attempt Found State */}
-        {!loading && !error && studentName.trim() && !attempt && (
+        {!loading && !error && !attempt && (
           <div className="bg-gray-900 border border-white/10 rounded-2xl p-10 text-center shadow-xl">
             <div className="text-4xl mb-3">🔍</div>
             <h2 className="text-lg font-bold text-white mb-2">No Attempt Found</h2>
             <p className="text-xs text-gray-400 max-w-md mx-auto mb-6">
-              We couldn't find any exam attempt for{' '}
-              <span className="text-white font-medium">{studentName}</span> in this exam. If you
-              joined under a different name, please check your enrolled exams list.
+              We couldn't find any exam attempt for your account in this exam.
             </p>
             <Link
               to="/student"
@@ -314,9 +246,7 @@ export function StudentResultPage() {
             </p>
             <div className="flex flex-wrap items-center justify-center gap-3">
               <Link
-                to={`/student/lobby/${encodeURIComponent(examId!)}?name=${encodeURIComponent(
-                  studentName,
-                )}`}
+                to={`/student/lobby/${encodeURIComponent(examId!)}`}
                 className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-lg shadow-indigo-900/40 transition-colors"
               >
                 Continue Exam →

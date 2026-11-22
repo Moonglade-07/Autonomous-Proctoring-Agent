@@ -25,11 +25,13 @@ interface UseWebSocketOptions {
 export function useWebSocket({ sessionId, examId, studentName, onMessage }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<WSStatus>('connecting');
+  const [closeReason, setCloseReason] = useState<string | null>(null);
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
+    if (!sessionId || sessionId === 'pending' || sessionId === 'session-ssr') return;
 
     // Determine WebSocket URL — same host, /api/exam/:sessionId?examId=...&name=...
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -60,9 +62,13 @@ export function useWebSocket({ sessionId, examId, studentName, onMessage }: UseW
       if (mountedRef.current) setStatus('error');
     };
 
-    ws.onclose = () => {
+    ws.onclose = (evt: CloseEvent) => {
       if (mountedRef.current) {
         setStatus('closed');
+        if (evt.code === 4001) {
+          setCloseReason('This exam is open in another window');
+          return;
+        }
         // Auto-reconnect after 3 seconds
         reconnectTimeout.current = setTimeout(() => {
           if (mountedRef.current) connect();
@@ -117,5 +123,5 @@ export function useWebSocket({ sessionId, examId, studentName, onMessage }: UseW
     }
   }, []);
 
-  return { sendEvent, sendRaw, status };
+  return { sendEvent, sendRaw, status, closeReason };
 }

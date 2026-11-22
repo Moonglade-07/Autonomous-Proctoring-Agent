@@ -21,9 +21,9 @@
  *   POST /command-ack      — Phase 3b: forward student ack back to professors
  *   GET  /internal/history/:sessionId — fetch summary for a session
  *
- * Phase 3b additions:
+ * Phase 3b & 5a additions:
  *   • Professor WebSocket now accepts inbound messages of type 'command'.
- *   • The hub validates the PROFESSOR_KEY and routes commands to the target
+ *   • The hub validates exam ownership via canAccessExam and routes commands to the target
  *     ExamSessionDO via POST /command.
  *   • The hub broadcasts command_result back to the issuing professor.
  */
@@ -37,6 +37,7 @@ import type {
   InterventionAction,
 } from './types.js';
 import { verifyInternalAuth, forbiddenResponse, jsonNotFound } from './utils/internalAuth.js';
+import { canAccessExam } from './utils/auth.js';
 
 export class ExamHubDO implements DurableObject {
   private state: DurableObjectState;
@@ -47,6 +48,9 @@ export class ExamHubDO implements DurableObject {
 
   /** All connected professor WebSocket connections */
   private profSockets: Set<WebSocket> = new Set();
+
+  /** Attached user metadata per professor WebSocket */
+  private profSocketUsers: Map<WebSocket, { userId: string; userRole: string; examId: string; tokenVersion: number }> = new Map();
 
   /** Recent alert feed — capped at 200 */
   private alerts: HubAlert[] = [];
@@ -105,16 +109,15 @@ export class ExamHubDO implements DurableObject {
         return new Response('Expected WebSocket upgrade', { status: 426 });
       }
 
-      // Phase 3b: Key guard (temporary, until Phase 5 auth)
-      const expectedKey = (this.env as any).PROFESSOR_KEY as string | undefined;
-      const providedKey = url.searchParams.get('key') || '';
-      if (expectedKey && providedKey !== expectedKey) {
-        return new Response('Unauthorized: Invalid or missing professor key.', { status: 401 });
-      }
-
       const { 0: client, 1: server } = new WebSocketPair();
       server.accept();
       this.profSockets.add(server);
+
+      const userId = url.searchParams.get('userId') || '';
+      const userRole = url.searchParams.get('userRole') || '';
+      const examId = url.searchParams.get('examId') || '';
+      const tokenVersion = parseInt(url.searchParams.get('tokenVersion') || '0', 10);
+      this.profSocketUsers.set(server, { userId, userRole, examId, tokenVersion });
 
       // Send full snapshot immediately on connect
       this.sendToSocket(server, {
@@ -132,10 +135,12 @@ export class ExamHubDO implements DurableObject {
 
       server.addEventListener('close', () => {
         this.profSockets.delete(server);
+        this.profSocketUsers.delete(server);
       });
 
       server.addEventListener('error', () => {
         this.profSockets.delete(server);
+        this.profSocketUsers.delete(server);
       });
 
       return new Response(null, { status: 101, webSocket: client });
@@ -263,17 +268,59 @@ export class ExamHubDO implements DurableObject {
 
     if (msg.type !== 'command') return; // ignore unknown message types
 
-    // ── Key validation ────────────────────────────────────────────────────────
-    const expectedKey = (this.env as any).PROFESSOR_KEY as string | undefined;
-    if (expectedKey && msg.key !== expectedKey) {
+    const userMeta = this.profSocketUsers.get(socket);
+    if (!userMeta || !userMeta.userId) {
       this.sendToSocket(socket, {
         type: 'command_result',
-        sessionId: msg.sessionId,
-        action: msg.action,
+        sessionId: msg.sessionId || '',
+        action: msg.action || 'warn',
         status: 'error',
-        message: 'Unauthorized: incorrect professor key.',
+        message: 'Unauthorized: Missing user authentication on hub socket.',
       } satisfies HubOutboundMsg);
+      try {
+        socket.close(1008, 'Unauthorized');
+      } catch {}
       return;
+    }
+
+    // Dynamic user reload and validation on EVERY inbound command message (Phase 5a Requirement 5)
+    if (this.env.DB) {
+      const liveUser = await this.env.DB.prepare(
+        'SELECT id, role, active, token_version FROM users WHERE id = ?',
+      )
+        .bind(userMeta.userId)
+        .first<{ id: string; role: string; active: number; token_version: number }>();
+
+      if (!liveUser || liveUser.active === 0 || liveUser.token_version !== userMeta.tokenVersion) {
+        this.sendToSocket(socket, {
+          type: 'command_result',
+          sessionId: msg.sessionId || '',
+          action: msg.action || 'warn',
+          status: 'error',
+          message: 'Unauthorized: Account deactivated or session revoked.',
+        } satisfies HubOutboundMsg);
+        try {
+          socket.close(1008, 'Account deactivated or session revoked');
+        } catch {}
+        this.profSockets.delete(socket);
+        this.profSocketUsers.delete(socket);
+        return;
+      }
+
+      // Re-check canAccessExam on EVERY inbound command message with live user credentials
+      const exam = await this.env.DB.prepare('SELECT id, created_by FROM exams WHERE id = ?')
+        .bind(userMeta.examId)
+        .first<Record<string, unknown>>();
+      if (!exam || !canAccessExam(exam, { id: liveUser.id, role: liveUser.role })) {
+        this.sendToSocket(socket, {
+          type: 'command_result',
+          sessionId: msg.sessionId || '',
+          action: msg.action || 'warn',
+          status: 'error',
+          message: 'Forbidden: You do not have permission to issue commands on this exam.',
+        } satisfies HubOutboundMsg);
+        return;
+      }
     }
 
     const { sessionId, action, message } = msg;

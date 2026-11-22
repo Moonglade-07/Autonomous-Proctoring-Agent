@@ -1,21 +1,22 @@
 /**
- * src/pages/StudentExamListPage.tsx — Student Exam Portal & Join by Code (Phase 4c-1)
+ * src/pages/StudentExamListPage.tsx — Student Exam Portal & Join by Code (Phase 4c-1 & 5a)
  *
  * Route: /student
  *
  * Features:
- *   • Student Name field (persists in sessionStorage)
+ *   • Bound to authenticated student account (name & ID from AuthContext)
  *   • "Enter exam code" input (XXXX-XXXX format supported, auto-capitalizes)
- *   • "Join Exam" button calling POST /api/student/join { code, studentName }
- *   • On successful join, navigates to /student/lobby/:examId?name=:name
+ *   • "Join Exam" button calling POST /api/student/join { code }
+ *   • On successful join, navigates to /student/lobby/:examId
  *   • Anti-probing compliant error display
  *   • Rate limit (HTTP 429) friendly error display
- *   • "My Exams" list populated via GET /api/student/my-exams?name=
- *   • Global exam list completely removed
+ *   • "My Exams" list populated via GET /api/student/my-exams
+ *   • Shows logged-in user and Sign Out button
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate, useSearchParams, Link } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 import type { MyExamEntry } from '../types';
 
 function formatDuration(mins: number): string {
@@ -28,11 +29,8 @@ function formatDuration(mins: number): string {
 export function StudentExamListPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { user, logout } = useAuth();
 
-  // Pre-fill name and code from URL or sessionStorage
-  const [studentName, setStudentName] = useState(
-    () => searchParams.get('name') || sessionStorage.getItem('apa_student_name') || '',
-  );
   const [code, setCode] = useState(
     () => searchParams.get('code') || '',
   );
@@ -45,14 +43,10 @@ export function StudentExamListPage() {
   const [loadingMyExams, setLoadingMyExams] = useState(false);
 
   // Fetch enrolled exams for this student
-  const loadMyExams = useCallback(async (name: string) => {
-    if (!name.trim()) {
-      setMyExams([]);
-      return;
-    }
+  const loadMyExams = useCallback(async () => {
     setLoadingMyExams(true);
     try {
-      const res = await fetch(`/api/student/my-exams?name=${encodeURIComponent(name.trim())}`);
+      const res = await fetch('/api/student/my-exams');
       if (res.ok) {
         const data = (await res.json()) as { exams: MyExamEntry[] };
         setMyExams(data.exams || []);
@@ -63,23 +57,14 @@ export function StudentExamListPage() {
     }
   }, []);
 
-  // Update name in storage and load exams
   useEffect(() => {
-    if (studentName.trim()) {
-      sessionStorage.setItem('apa_student_name', studentName.trim());
-      void loadMyExams(studentName.trim());
-    }
-  }, [studentName, loadMyExams]);
+    void loadMyExams();
+  }, [loadMyExams]);
 
   async function handleJoin(e: React.FormEvent) {
     e.preventDefault();
-    const cleanName = studentName.trim();
     const cleanCode = code.trim();
 
-    if (!cleanName) {
-      setJoinError('Please enter your full name');
-      return;
-    }
     if (!cleanCode) {
       setJoinError('Please enter an exam code');
       return;
@@ -94,7 +79,6 @@ export function StudentExamListPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           code: cleanCode,
-          studentName: cleanName,
         }),
       });
 
@@ -111,8 +95,7 @@ export function StudentExamListPage() {
       }
 
       if (data.id) {
-        sessionStorage.setItem('apa_student_name', cleanName);
-        navigate(`/student/lobby/${data.id}?name=${encodeURIComponent(cleanName)}`);
+        navigate(`/student/lobby/${data.id}`);
       }
     } catch (err) {
       setJoinError(err instanceof Error ? err.message : 'Invalid or inactive code');
@@ -191,12 +174,20 @@ export function StudentExamListPage() {
               <p className="text-[11px] text-gray-400">Autonomous Proctoring System</p>
             </div>
           </div>
-          <Link
-            to="/professor/exams"
-            className="text-xs text-gray-400 hover:text-white transition-colors"
-          >
-            Professor Portal →
-          </Link>
+          <div className="flex items-center gap-4">
+            {user && (
+              <span className="text-xs text-slate-400 hidden sm:inline">
+                Signed in as <strong className="text-white">{user.name}</strong>
+                {user.student_id ? ` (${user.student_id})` : ''}
+              </span>
+            )}
+            <button
+              onClick={() => void logout()}
+              className="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 transition-colors"
+            >
+              Sign Out
+            </button>
+          </div>
         </div>
       </header>
 
@@ -210,7 +201,7 @@ export function StudentExamListPage() {
             </div>
             <h2 className="text-xl font-bold text-white">Join an Exam</h2>
             <p className="text-xs sm:text-sm text-gray-400 mt-1">
-              Enter your name and the 8-character exam code provided by your instructor.
+              Enter the 8-character exam code provided by your instructor.
             </p>
           </div>
 
@@ -221,21 +212,6 @@ export function StudentExamListPage() {
           )}
 
           <form onSubmit={handleJoin} className="space-y-4">
-            <div>
-              <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block mb-1.5">
-                Your Full Name (Student ID) *
-              </label>
-              <input
-                id="student-name-input"
-                type="text"
-                value={studentName}
-                onChange={(e) => setStudentName(e.target.value)}
-                placeholder="e.g. Jane Doe"
-                required
-                className="w-full bg-gray-800/80 border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors"
-              />
-            </div>
-
             <div>
               <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider block mb-1.5">
                 Exam Access Code *
@@ -267,69 +243,67 @@ export function StudentExamListPage() {
         </div>
 
         {/* My Exams Section */}
-        {studentName.trim() && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between border-b border-white/10 pb-3">
-              <h3 className="text-sm font-bold text-gray-300 uppercase tracking-wider">
-                📚 My Joined Exams
-              </h3>
-              <span className="text-xs text-gray-500">
-                {myExams.length} enrolled
-              </span>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between border-b border-white/10 pb-3">
+            <h3 className="text-sm font-bold text-gray-300 uppercase tracking-wider">
+              📚 My Joined Exams
+            </h3>
+            <span className="text-xs text-gray-500">
+              {myExams.length} enrolled
+            </span>
+          </div>
+
+          {loadingMyExams ? (
+            <div className="text-center py-6 text-xs text-gray-500">Loading your exams…</div>
+          ) : myExams.length === 0 ? (
+            <div className="text-center py-8 bg-gray-900/40 border border-dashed border-white/10 rounded-2xl p-6 text-gray-500 text-xs">
+              You haven't joined any exams yet. Enter an exam code above to join.
             </div>
-
-            {loadingMyExams ? (
-              <div className="text-center py-6 text-xs text-gray-500">Loading your exams…</div>
-            ) : myExams.length === 0 ? (
-              <div className="text-center py-8 bg-gray-900/40 border border-dashed border-white/10 rounded-2xl p-6 text-gray-500 text-xs">
-                You haven't joined any exams yet. Enter an exam code above to join.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {myExams.map((ex) => (
-                  <div
-                    key={ex.id}
-                    className="p-4 rounded-xl bg-gray-900/70 border border-white/10 flex items-center justify-between gap-4 hover:border-white/20 transition-colors"
-                  >
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-white">{ex.title}</span>
-                        {ex.course_code && (
-                          <span className="text-[10px] text-gray-400 bg-white/5 px-2 py-0.5 rounded border border-white/5">
-                            {ex.course_code}
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-400">
-                        <span>⏱ {formatDuration(ex.duration_minutes)}</span>
-                        <span>·</span>
-                        {getAttemptStatusBadge(ex)}
-                      </div>
-                    </div>
-
-                    <div>
-                      {ex.attempt_status === 'submitted' || ex.attempt_status === 'auto_submitted' || ex.attempt_status === 'terminated' ? (
-                        <Link
-                          to={`/student/result/${encodeURIComponent(ex.id)}?name=${encodeURIComponent(studentName.trim())}`}
-                          className="px-3.5 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs font-semibold text-gray-200 border border-white/10 transition-colors inline-block"
-                        >
-                          View Result →
-                        </Link>
-                      ) : (
-                        <Link
-                          to={`/student/lobby/${encodeURIComponent(ex.id)}?name=${encodeURIComponent(studentName.trim())}`}
-                          className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white shadow-md shadow-indigo-900/40 transition-colors inline-block"
-                        >
-                          Go to Lobby →
-                        </Link>
+          ) : (
+            <div className="space-y-3">
+              {myExams.map((ex) => (
+                <div
+                  key={ex.id}
+                  className="p-4 rounded-xl bg-gray-900/70 border border-white/10 flex items-center justify-between gap-4 hover:border-white/20 transition-colors"
+                >
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-white">{ex.title}</span>
+                      {ex.course_code && (
+                        <span className="text-[10px] text-gray-400 bg-white/5 px-2 py-0.5 rounded border border-white/5">
+                          {ex.course_code}
+                        </span>
                       )}
                     </div>
+                    <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-400">
+                      <span>⏱ {formatDuration(ex.duration_minutes)}</span>
+                      <span>·</span>
+                      {getAttemptStatusBadge(ex)}
+                    </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+
+                  <div>
+                    {ex.attempt_status === 'submitted' || ex.attempt_status === 'auto_submitted' || ex.attempt_status === 'terminated' ? (
+                      <Link
+                        to={`/student/result/${encodeURIComponent(ex.id)}`}
+                        className="px-3.5 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-xs font-semibold text-gray-200 border border-white/10 transition-colors inline-block"
+                      >
+                        View Result →
+                      </Link>
+                    ) : (
+                      <Link
+                        to={`/student/lobby/${encodeURIComponent(ex.id)}`}
+                        className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white shadow-md shadow-indigo-900/40 transition-colors inline-block"
+                      >
+                        Go to Lobby →
+                      </Link>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </main>
     </div>
   );

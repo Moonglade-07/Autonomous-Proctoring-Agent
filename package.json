@@ -13,6 +13,7 @@
     "db:migrate:local": "wrangler d1 migrations apply apa-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply apa-db --remote",
     "db:seed:local": "wrangler d1 execute apa-db --local --file=seed.sql",
+    "user:create": "node scripts/create-user.mjs",
     "test": "vitest run"
   },
   "dependencies": {

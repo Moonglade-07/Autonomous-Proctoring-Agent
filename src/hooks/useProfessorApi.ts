@@ -1,7 +1,7 @@
 /**
- * src/hooks/useProfessorApi.ts — typed fetch wrapper for /api/professor/* (Phase 4a & 4c-1)
+ * src/hooks/useProfessorApi.ts — typed fetch wrapper for /api/professor/* (Phase 4a & 5a)
  *
- * Reads X-Professor-Key from sessionStorage.
+ * Uses authenticated session cookie (auth_token).
  * All methods throw on HTTP error ≥ 400.
  */
 
@@ -16,47 +16,19 @@ import type {
   StudentQuestion,
 } from '../types';
 
-export const PROFESSOR_STORAGE_KEYS = ['apa_professor_key', 'professorKey'] as const;
-
-/** Returns the stored professor key (or empty string if not set). Checks both storage keys for compatibility. */
-export function getProfessorKey(): string {
-  for (const k of PROFESSOR_STORAGE_KEYS) {
-    const val = sessionStorage.getItem(k);
-    if (val) return val;
-  }
-  return '';
-}
-
-/** Saves the professor key across all storage keys. */
-export function setProfessorKey(key: string): void {
-  for (const k of PROFESSOR_STORAGE_KEYS) {
-    sessionStorage.setItem(k, key);
-  }
-}
-
-/** Clears the professor key from all storage keys. */
-export function clearProfessorKey(): void {
-  for (const k of PROFESSOR_STORAGE_KEYS) {
-    sessionStorage.removeItem(k);
-  }
-}
-
-function getKey(): string {
-  return getProfessorKey();
-}
-
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const key = getKey();
   const res = await fetch(`/api/professor${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
-      'X-Professor-Key': key,
       ...(init.headers ?? {}),
     },
   });
 
   if (!res.ok) {
+    if (res.status === 401 && typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+      window.location.href = '/login';
+    }
     const body = (await res.json().catch(() => ({ error: res.statusText }))) as {
       error?: string;
       details?: unknown;
