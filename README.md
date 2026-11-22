@@ -542,5 +542,81 @@ npm run user:create -- --role admin --email admin@university.edu --name "System 
 npm run user:create -- --role admin --email admin@university.edu --name "System Administrator" --remote
 ```
 
+---
+
+## Phase 5c: Landing Page, Student & Professor Dashboards, Privacy Notice & Results Analytics
+
+Phase 5c introduces dedicated, role-specific portals, streamlined navigation without manual URL typing, an enforceable student privacy consent model, account management with password changes, exam archiving, and exportable analytics.
+
+### 1. D1 Migration (`0007_dashboards.sql`)
+- **`users` table**:
+  - `privacy_accepted_at TEXT` (nullable ISO-8601 UTC timestamp).
+  - `password_changed_at TEXT` (nullable ISO-8601 UTC timestamp).
+- **`exams` table**:
+  - `archived INTEGER NOT NULL DEFAULT 0` (0 = active, 1 = archived).
+  - `archived_at TEXT` (nullable ISO-8601 UTC timestamp).
+- **Performance index**:
+  - `idx_exams_created_by_archived ON exams(created_by, archived)`.
+
+### 2. Change Password Flow (`POST /api/auth/change-password`)
+- Authenticated endpoint available to all roles (`student`, `professor`, `admin`).
+- Verifies `currentPassword` against stored PBKDF2 hash using constant-time comparison.
+- Enforces 10 to 128 character password length.
+- Generates a fresh 16-byte cryptographically random salt and 100,000-iteration PBKDF2 SHA-256 hash.
+- **Session Revocation**: Increments `token_version` in D1, invalidating all other active JWT sessions across devices immediately.
+- Re-issues a fresh `auth_token` cookie for the current session.
+- **Rate Limiting**: 5 incorrect password attempts within 15 minutes returns `429 Too Many Requests`.
+- Appends an audit log record with `action: 'change_password'`. Passwords are never logged or returned.
+
+### 3. Student Privacy Notice & Consent Gate
+- **Enforcement**:
+  - `POST /api/student/join` and `POST /api/student/exams/:id/start` verify `privacy_accepted_at` on the student account.
+  - Returns `403 Forbidden` with `{ code: 'privacy_required' }` if unaccepted.
+  - Professor preview attempts (`is_test = 1`) are strictly exempt.
+- **Consent Modal & Page (`/student/privacy`)**:
+  - Plain-language explanation of monitored signals (webcam frames, face detection, tab switches, fullscreen status, copy/paste).
+  - Clear statement of data storage (edge-only Cloudflare D1/DO, automated retention purges, no third-party selling or ad profiling).
+  - Explicit explanation of Cloudflare Workers AI model inference.
+  - One-click consent button (`POST /api/student/accept-privacy`) logging acceptance timestamp.
+
+### 4. Role-Specific Portals & Navigation
+- **Landing Page (`/`)**:
+  - Clean overview of features for students and professors.
+  - Automatically redirects authenticated users to their respective home dashboard (`/student` or `/professor`).
+- **Student Portal (`/student`)**:
+  - Top navigation bar (`StudentNav`) with links to Home, System Check, FAQ Help, Profile, and Sign Out (no professor links).
+  - **Join Card**: Input field for 8-character exam code; clears error messages as soon as the student edits the code.
+  - **In-Progress Section**: Direct "Resume Exam" cards with elapsed time indicators.
+  - **Upcoming & Joined Section**: Enrolled exams with live countdown timers, start/end windows, and durations.
+  - **Past Exams Section**: Complete exam history showing submission status, final score, percentage, and direct links to view released results.
+  - **System Readiness Check (`/student/system-check`)**: Self-service diagnostics for camera hardware, fullscreen permission, modern browser compatibility, and edge network latency to `/api/health`. Results persist in `localStorage`.
+  - **Student Profile (`/student/profile`)**: Update display name, student ID number, change account password, and view privacy policy.
+  - **Help & FAQ (`/student/help`)**: Common questions regarding proctoring, system requirements, interruptions, and academic integrity.
+- **Professor Dashboard (`/professor`)**:
+  - Top navigation bar (`ProfessorNav`) linking to Dashboard, Exam Management, Profile, and Sign Out.
+  - **Summary Cards**: Real-time metrics for *Live Now*, *Upcoming*, *Needs Manual Grading*, and *Flagged for Violations*.
+  - **Needs Attention Queue**: Prioritized list of exams requiring grading or review with direct jump links.
+  - **Exam Management Cards**: Organized under tabs (*All*, *Draft*, *Scheduled*, *Live*, *Ended*, *Archived*) with live search, sorting (creation date, start date, title), and direct navigation to Exam Editor, Live Monitor, or Submissions.
+  - **Archiving Lifecycle**:
+    - `POST /api/professor/exams/:id/archive`: Archives past or draft exams, deactivating the join code. Refuses with `409 Conflict` if the exam is currently live.
+    - `POST /api/professor/exams/:id/unarchive`: Restores archived exams.
+- **Custom 404 Page (`NotFoundPage`)**: Role-aware fallback preventing unintended route leaking.
+
+### 5. Results Analytics & Secure CSV Export
+- **Results Tab Analytics**:
+  - Score distribution bar chart visualizing score ranges across student submissions.
+  - Question-by-question auto-graded accuracy rates (% of students answering correctly) with difficulty indicators.
+- **CSV Results Export (`GET /api/professor/exams/:id/results.csv`)**:
+  - Generates download of student grades: Student Name, Student ID, Email, Score, Max Score, Percentage, Status, Violations, Submitted At.
+  - **Spreadsheet Formula Injection Defense**: Prepend single quote (`'`) to any text field starting with `=`, `+`, `-`, or `@` to prevent remote code or formula execution in Excel/Google Sheets.
+  - Test attempts (`is_test = 1`) are excluded.
+  - Proctored telemetry snapshots, answer contents, and AI internal reasoning are omitted.
+  - Appends an audit log entry for the export event.
+
+### 6. Known Scope Limitations
+- Password reset via email and email verification are intentionally not implemented (requires email delivery integration).
+- Proctoring time extensions, broadcast messaging, and pre-uploaded student rosters are scheduled for future milestones.
+
+
 
 

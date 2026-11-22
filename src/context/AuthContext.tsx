@@ -15,7 +15,9 @@ export interface AuthUser {
   role: 'student' | 'professor' | 'admin';
   student_id: string | null;
   department: string | null;
-  created_at: string;
+  privacy_accepted?: boolean;
+  privacy_accepted_at?: string | null;
+  created_at?: string;
 }
 
 interface AuthState {

@@ -27,6 +27,7 @@ import { useAuth } from '../context/AuthContext';
 import { WebcamPreview } from '../components/WebcamPreview';
 import { RiskIndicator } from '../components/RiskIndicator';
 import { EventLog } from '../components/EventLog';
+import { PrivacyConsentModal } from '../components/PrivacyConsentModal';
 import { IdentityCaptureModal } from '../components/IdentityCaptureModal';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useBehavioralDetection } from '../hooks/useBehavioralDetection';
@@ -770,6 +771,7 @@ export function ExamPage() {
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [activeTab, setActiveTab] = useState<'questions' | 'telemetry'>('questions');
   const [showSessionExpiredModal, setShowSessionExpiredModal] = useState(false);
+  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
 
   // Submission & Result state
   const [isSubmitted, setIsSubmitted] = useState(false);
@@ -991,8 +993,17 @@ export function ExamPage() {
         const ct = r.headers.get('content-type');
         if (!r.ok) {
           if (ct && ct.includes('application/json')) {
-            const e = (await r.json()) as { error?: string };
-            throw new Error(e.error || `HTTP ${r.status}`);
+            const e = (await r.json()) as { error?: string | { code?: string; message?: string }; code?: string };
+            if (
+              r.status === 403 &&
+              (e.code === 'privacy_required' ||
+                (typeof e.error === 'object' && e.error?.code === 'privacy_required'))
+            ) {
+              setShowPrivacyModal(true);
+              return null;
+            }
+            const msg = typeof e.error === 'string' ? e.error : e.error?.message || `HTTP ${r.status}`;
+            throw new Error(msg);
           }
           throw new Error(`Server returned HTTP ${r.status}`);
         }
@@ -1002,6 +1013,7 @@ export function ExamPage() {
         throw new Error('Server returned non-JSON response');
       })
       .then((data) => {
+        if (!data) return;
         if (data.error) setLoadError(data.error);
         else setExamMeta(data.exam);
       })
@@ -1104,8 +1116,17 @@ export function ExamPage() {
       const ct = res.headers.get('content-type');
       if (!res.ok) {
         if (ct && ct.includes('application/json')) {
-          const errJson = (await res.json()) as { error: string };
-          throw new Error(errJson.error || `Failed to start exam (HTTP ${res.status})`);
+          const errJson = (await res.json()) as { error?: string | { code?: string; message?: string }; code?: string };
+          if (
+            res.status === 403 &&
+            (errJson.code === 'privacy_required' ||
+              (typeof errJson.error === 'object' && errJson.error?.code === 'privacy_required'))
+          ) {
+            setShowPrivacyModal(true);
+            return;
+          }
+          const msg = typeof errJson.error === 'string' ? errJson.error : errJson.error?.message || `Failed to start exam (HTTP ${res.status})`;
+          throw new Error(msg);
         }
         throw new Error(`Failed to start exam (HTTP ${res.status})`);
       }
@@ -1280,7 +1301,7 @@ export function ExamPage() {
 
   // ── Countdown Timer Tick ───────────────────────────────────────────────────
   useEffect(() => {
-    if (!attempt || isSubmitted || isPaused) return;
+    if (!attempt || isSubmitted || isPaused || showPrivacyModal) return;
     if (secondsRemaining <= 0) {
       void handleAutoSubmit();
       return;
@@ -1473,6 +1494,17 @@ export function ExamPage() {
           submitting={submitting}
         />
       )}
+      <PrivacyConsentModal
+        isOpen={showPrivacyModal}
+        onConsentSuccess={async () => {
+          setShowPrivacyModal(false);
+          await handleIdentityConfirmed();
+        }}
+        onCancel={() => {
+          setShowPrivacyModal(false);
+          navigate('/student');
+        }}
+      />
 
       {/* ── Top Header ────────────────────────────────────────────────────── */}
       <header className="border-b border-white/[0.08] bg-gray-900/90 backdrop-blur-md sticky top-0 z-40">

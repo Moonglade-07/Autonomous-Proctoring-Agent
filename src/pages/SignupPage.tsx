@@ -26,7 +26,7 @@ export function SignupPage() {
       if (user.role === 'student') {
         navigate('/student', { replace: true });
       } else {
-        navigate('/professor/exams', { replace: true });
+        navigate('/professor', { replace: true });
       }
     }
   }, [user, navigate]);

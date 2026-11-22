@@ -342,6 +342,27 @@ function SubmissionsTab({
             📋 Grade by Question
           </button>
 
+          <a
+            href={`/api/professor/exams/${encodeURIComponent(examId)}/results.csv`}
+            download={`${exam?.title || 'results'}.csv`}
+            style={{
+              background: 'rgba(99, 102, 241, 0.15)',
+              color: '#a5b4fc',
+              border: '1px solid rgba(99, 102, 241, 0.3)',
+              borderRadius: 8,
+              padding: '7px 14px',
+              fontSize: 12,
+              fontWeight: 600,
+              textDecoration: 'none',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              cursor: 'pointer',
+            }}
+          >
+            📥 Export results (CSV)
+          </a>
+
           <button
             type="button"
             onClick={handleToggleRelease}
@@ -365,6 +386,105 @@ function SubmissionsTab({
           </button>
         </div>
       </div>
+
+      {/* ── Results Analytics Section (Phase 5c) ───────────────────────────── */}
+      {attempts.length > 0 && (
+        <div
+          style={{
+            background: 'rgba(15, 23, 42, 0.7)',
+            border: '1px solid rgba(255, 255, 255, 0.08)',
+            borderRadius: 12,
+            padding: 18,
+            marginBottom: 20,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 16,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <h3 style={{ margin: 0, fontSize: 13, fontWeight: 700, color: '#f8fafc', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>📊</span> Results Analytics
+            </h3>
+            <span style={{ fontSize: 11, color: '#64748b' }}>
+              Non-test graded submissions ({attempts.filter((a) => !a.is_test && a.score !== null).length})
+            </span>
+          </div>
+
+          {/* Score Distribution Chart */}
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#94a3b8', marginBottom: 8 }}>
+              Score Distribution
+            </div>
+            {(() => {
+              const nonTestGraded = attempts.filter((a) => !a.is_test && a.score !== null && a.status !== 'in_progress');
+              const totalGraded = nonTestGraded.length;
+              const maxExamScore = (exam as unknown as { total_points?: number })?.total_points || 100;
+              const buckets = [
+                { label: '0–20%', count: 0, min: 0, max: 20, color: '#f87171' },
+                { label: '21–40%', count: 0, min: 21, max: 40, color: '#fb923c' },
+                { label: '41–60%', count: 0, min: 41, max: 60, color: '#facc15' },
+                { label: '61–80%', count: 0, min: 61, max: 80, color: '#60a5fa' },
+                { label: '81–100%', count: 0, min: 81, max: 100, color: '#4ade80' },
+              ];
+              for (const a of nonTestGraded) {
+                const pct = maxExamScore > 0 ? Math.min(100, Math.max(0, Math.round(((a.score as number) / maxExamScore) * 100))) : 0;
+                for (const b of buckets) {
+                  if (pct >= b.min && pct <= b.max) {
+                    b.count++;
+                    break;
+                  }
+                }
+              }
+              return (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10 }}>
+                  {buckets.map((b) => {
+                    const barHeightPct = totalGraded > 0 ? Math.round((b.count / totalGraded) * 100) : 0;
+                    return (
+                      <div
+                        key={b.label}
+                        style={{
+                          background: 'rgba(255, 255, 255, 0.02)',
+                          border: '1px solid rgba(255, 255, 255, 0.05)',
+                          borderRadius: 8,
+                          padding: '10px 8px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          gap: 6,
+                        }}
+                      >
+                        <span style={{ fontSize: 13, fontWeight: 700, color: '#f1f5f9' }}>{b.count}</span>
+                        <div
+                          style={{
+                            width: '100%',
+                            height: 48,
+                            background: 'rgba(255, 255, 255, 0.04)',
+                            borderRadius: 4,
+                            display: 'flex',
+                            alignItems: 'flex-end',
+                            overflow: 'hidden',
+                          }}
+                        >
+                          <div
+                            style={{
+                              width: '100%',
+                              height: `${Math.max(barHeightPct > 0 ? 8 : 0, barHeightPct)}%`,
+                              background: b.color,
+                              borderRadius: '2px 2px 0 0',
+                              transition: 'height 0.3s ease',
+                            }}
+                          />
+                        </div>
+                        <span style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600 }}>{b.label}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
 
       {/* Submissions Table */}
       {attempts.length === 0 ? (

@@ -361,6 +361,30 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
         if (line.includes("subPath === '/reset'") && line.includes('POST')) {
           detectedRoutes.push({ method: 'POST', path: '/api/professor/exams/:id/reset', file: relFile });
         }
+        if (line.includes("path === '/change-password'") && line.includes('POST')) {
+          detectedRoutes.push({ method: 'POST', path: '/api/auth/change-password', file: relFile });
+        }
+        if (line.includes("path === '/accept-privacy'") && line.includes('POST')) {
+          detectedRoutes.push({ method: 'POST', path: '/api/student/accept-privacy', file: relFile });
+        }
+        if (line.includes("path === '/home'") && line.includes('GET') && relFile.includes('student')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/student/home', file: relFile });
+        }
+        if (line.includes("path === '/profile'") && line.includes('PUT') && relFile.includes('student')) {
+          detectedRoutes.push({ method: 'PUT', path: '/api/student/profile', file: relFile });
+        }
+        if (line.includes("path === '/home'") && line.includes('GET') && relFile.includes('exams')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/professor/home', file: relFile });
+        }
+        if (line.includes("subPath === '/archive'") && line.includes('POST')) {
+          detectedRoutes.push({ method: 'POST', path: '/api/professor/exams/:id/archive', file: relFile });
+        }
+        if (line.includes("subPath === '/unarchive'") && line.includes('POST')) {
+          detectedRoutes.push({ method: 'POST', path: '/api/professor/exams/:id/unarchive', file: relFile });
+        }
+        if (line.includes("subPath === '/results.csv'") && line.includes('GET')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/professor/exams/:id/results.csv', file: relFile });
+        }
       }
     }
 
@@ -375,8 +399,8 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
       ).toBeDefined();
     }
 
-    // Total registered routes count must match 54
-    expect(WORKER_ROUTER_TABLE.length).toBe(54);
+    // Total registered routes count must match 62
+    expect(WORKER_ROUTER_TABLE.length).toBe(62);
   });
 });
 

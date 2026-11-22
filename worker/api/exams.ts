@@ -33,6 +33,7 @@ import { handleGradingApi } from './grading.js';
 import { handleSessionsApi } from './sessions.js';
 import { requireAuth, isAuthResponse } from '../auth/requireAuth.js';
 import { writeAuditLog } from '../utils/audit.js';
+import { escapeCsv } from '../utils/csv.js';
 import {
   QuestionCreateSchema,
 } from '../utils/questionGrading.js';
@@ -87,7 +88,7 @@ function normalizeCorrectAnswer(
         });
         return JSON.stringify(normalized);
       }
-    } catch {}
+    } catch { }
   }
 
   return correctStr;
@@ -231,7 +232,7 @@ async function getExamWithQuestions(db: D1Database, examId: string) {
     if (r.options) {
       try {
         opts = Array.isArray(r.options) ? r.options : JSON.parse(r.options as string);
-      } catch {}
+      } catch { }
     }
     return {
       id: r.id as string,
@@ -333,10 +334,191 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
     return handleSessionsApi(request, env as any, path, method, examId, user);
   }
 
+  // ── GET /home ──────────────────────────────────────────────────────────────
+  if (path === '/home' && method === 'GET') {
+    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    const in24Hours = new Date(nowMs + 24 * 60 * 60 * 1000).toISOString();
+
+    const baseSql = `SELECT e.*, u.name AS owner_name,
+              (SELECT COUNT(*) FROM questions q WHERE q.exam_id = e.id) AS question_count,
+              (SELECT COALESCE(SUM(q.points), 0) FROM questions q WHERE q.exam_id = e.id) AS total_points,
+              (SELECT COUNT(*) FROM exam_enrollments en WHERE en.exam_id = e.id) AS student_count
+       FROM exams e
+       LEFT JOIN users u ON e.created_by = u.id`;
+
+    let rows;
+    if (user.role === 'admin') {
+      rows = await env.DB.prepare(`${baseSql} ORDER BY e.created_at DESC`).bind().all<Record<string, unknown>>();
+    } else {
+      rows = await env.DB.prepare(`${baseSql} WHERE e.created_by = ? ORDER BY e.created_at DESC`)
+        .bind(user.id)
+        .all<Record<string, unknown>>();
+    }
+
+    const examList = rows.results || [];
+    const examIds = examList.map((e) => e.id as string);
+
+    // Fetch submission statistics for these exams (test attempts excluded)
+    interface ExamAttemptStats {
+      submitted_count: number;
+      graded_count: number;
+      needs_grading_count: number;
+      flagged_count: number;
+      sum_score: number;
+      scored_count: number;
+    }
+    const attemptStatsMap = new Map<string, ExamAttemptStats>();
+
+    if (examIds.length > 0) {
+      const placeholders = examIds.map(() => '?').join(',');
+      const statsRows = await env.DB.prepare(
+        `SELECT exam_id,
+                COUNT(CASE WHEN status IN ('submitted', 'auto_submitted', 'terminated') THEN 1 END) AS submitted_count,
+                COUNT(CASE WHEN fully_graded = 1 THEN 1 END) AS graded_count,
+                COUNT(CASE WHEN status IN ('submitted', 'auto_submitted', 'terminated') AND (fully_graded IS NULL OR fully_graded = 0) THEN 1 END) AS needs_grading_count,
+                COUNT(CASE WHEN violation_count > 0 THEN 1 END) AS flagged_count,
+                COALESCE(SUM(score), 0) AS sum_score,
+                COUNT(CASE WHEN score IS NOT NULL THEN 1 END) AS scored_count
+         FROM attempts
+         WHERE exam_id IN (${placeholders}) AND is_test = 0
+         GROUP BY exam_id`,
+      )
+        .bind(...examIds)
+        .all<Record<string, unknown>>();
+
+      for (const row of statsRows.results) {
+        attemptStatsMap.set(row.exam_id as string, {
+          submitted_count: Number(row.submitted_count) || 0,
+          graded_count: Number(row.graded_count) || 0,
+          needs_grading_count: Number(row.needs_grading_count) || 0,
+          flagged_count: Number(row.flagged_count) || 0,
+          sum_score: Number(row.sum_score) || 0,
+          scored_count: Number(row.scored_count) || 0,
+        });
+      }
+    }
+
+    let liveCount = 0;
+    let upcomingCount = 0;
+    let totalNeedsGrading = 0;
+    let flaggedExamsCount = 0;
+
+    const needsAttention: Array<{
+      type: 'ungraded_submissions' | 'starting_soon_no_questions' | 'published_code_disabled' | 'results_not_released';
+      exam_id: string;
+      exam_title: string;
+      details?: Record<string, unknown>;
+    }> = [];
+
+    const enrichedExams = examList.map((e) => {
+      const derived = computeDerivedStatus(
+        e.status as string,
+        e.start_time as string | null,
+        e.end_time as string | null,
+      );
+      const isArchived = e.archived === 1;
+      const stats = attemptStatsMap.get(e.id as string) || {
+        submitted_count: 0,
+        graded_count: 0,
+        needs_grading_count: 0,
+        flagged_count: 0,
+        sum_score: 0,
+        scored_count: 0,
+      };
+
+      if (!isArchived) {
+        if (derived === 'live') liveCount++;
+        if (derived === 'scheduled') upcomingCount++;
+        totalNeedsGrading += stats.needs_grading_count;
+        if (stats.flagged_count > 0) flaggedExamsCount++;
+
+        if (stats.needs_grading_count > 0) {
+          needsAttention.push({
+            type: 'ungraded_submissions',
+            exam_id: e.id as string,
+            exam_title: e.title as string,
+            details: { count: stats.needs_grading_count },
+          });
+        }
+
+        const qCount = Number(e.question_count) || 0;
+        if (
+          qCount === 0 &&
+          e.start_time &&
+          (e.start_time as string) > nowIso &&
+          (e.start_time as string) <= in24Hours
+        ) {
+          needsAttention.push({
+            type: 'starting_soon_no_questions',
+            exam_id: e.id as string,
+            exam_title: e.title as string,
+            details: { start_time: e.start_time },
+          });
+        }
+
+        if (e.status === 'published' && e.join_code_active === 0) {
+          needsAttention.push({
+            type: 'published_code_disabled',
+            exam_id: e.id as string,
+            exam_title: e.title as string,
+          });
+        }
+
+        if (derived === 'ended' && !e.results_released) {
+          needsAttention.push({
+            type: 'results_not_released',
+            exam_id: e.id as string,
+            exam_title: e.title as string,
+            details: { ended_at: e.end_time },
+          });
+        }
+      }
+
+      const avgScore =
+        stats.scored_count > 0
+          ? Math.round((stats.sum_score / stats.scored_count) * 10) / 10
+          : null;
+
+      return {
+        ...e,
+        question_count: Number(e.question_count) || 0,
+        total_points: Number(e.total_points) || 0,
+        student_count: Number(e.student_count) || 0,
+        derived_status: derived,
+        submitted_count: stats.submitted_count,
+        graded_count: stats.graded_count,
+        needs_grading_count: stats.needs_grading_count,
+        average_score: avgScore,
+        flagged_count: stats.flagged_count,
+      };
+    });
+
+    return jsonOk({
+      summary: {
+        live_now: liveCount,
+        upcoming: upcomingCount,
+        needs_grading: totalNeedsGrading,
+        flagged_exams: flaggedExamsCount,
+      },
+      needs_attention: needsAttention,
+      exams: enrichedExams,
+    });
+  }
+
   // ── GET /exams ─────────────────────────────────────────────────────────────
   if (path === '/exams' && method === 'GET') {
     const search = url.searchParams.get('search')?.trim() || '';
     const status = url.searchParams.get('status')?.trim() || '';
+    const archivedParam = url.searchParams.get('archived');
+    const includeArchived = url.searchParams.get('include_archived') === 'true';
+
+    let filterSql = '';
+    if (archivedParam === 'true' || status === 'archived') {
+      filterSql = 'AND e.archived = 1';
+    } else if (!includeArchived) {
+      filterSql = 'AND COALESCE(e.archived, 0) = 0';
+    }
 
     const baseSql = `SELECT e.*,
               (SELECT COUNT(*) FROM questions q WHERE q.exam_id = e.id) AS question_count,
@@ -346,9 +528,9 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
 
     let rows;
     if (user.role === 'admin') {
-      rows = await env.DB.prepare(`${baseSql} ORDER BY e.created_at DESC`).all<Record<string, unknown>>();
+      rows = await env.DB.prepare(`${baseSql} WHERE 1=1 ${filterSql} ORDER BY e.created_at DESC`).all<Record<string, unknown>>();
     } else {
-      rows = await env.DB.prepare(`${baseSql} WHERE e.created_by = ? ORDER BY e.created_at DESC`)
+      rows = await env.DB.prepare(`${baseSql} WHERE e.created_by = ? ${filterSql} ORDER BY e.created_at DESC`)
         .bind(user.id)
         .all<Record<string, unknown>>();
     }
@@ -711,7 +893,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
     let body: { dryRun?: boolean; confirmTitle?: string; force?: boolean } = {};
     try {
       body = (await request.json()) as typeof body;
-    } catch {}
+    } catch { }
 
     const { dryRun, confirmTitle, force } = body;
 
@@ -806,7 +988,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
       if (!force || !titleMatches) {
         return jsonErr(
           'Cannot reset exam: Results have been released or graded/submitted attempts exist. ' +
-            'To reset, confirmTitle must match the exam title and force must be true.',
+          'To reset, confirmTitle must match the exam title and force must be true.',
           409,
         );
       }
@@ -846,7 +1028,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
             },
             body: JSON.stringify({ sessionId: att.session_id }),
           });
-        } catch {}
+        } catch { }
       }
 
       // DO purge
@@ -860,7 +1042,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
               'X-Internal-Auth': env.INTERNAL_SECRET || '',
             },
           });
-        } catch {}
+        } catch { }
       }
 
       await env.DB.prepare('DELETE FROM answers WHERE attempt_id = ?').bind(att.id).run();
@@ -898,6 +1080,140 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
     });
   }
 
+  // ── POST /exams/:id/archive ────────────────────────────────────────────────
+  if (subPath === '/archive' && method === 'POST') {
+    const derived = computeDerivedStatus(
+      rawExam.status as string,
+      rawExam.start_time as string | null,
+      rawExam.end_time as string | null,
+    );
+    if (derived === 'live') {
+      return jsonErr('Cannot archive a live exam', 409);
+    }
+
+    const nowIso = now();
+    await env.DB.prepare(
+      'UPDATE exams SET archived = 1, archived_at = ?, join_code_active = 0, updated_at = ? WHERE id = ?',
+    )
+      .bind(nowIso, nowIso, examId)
+      .run();
+
+    await writeAuditLog(env.DB, {
+      actor_user_id: user.id,
+      action: 'archive_exam',
+      target: examId,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+      meta: { title: rawExam.title },
+    });
+
+    const updated = await getExamWithQuestions(env.DB, examId);
+    return jsonOk({ ok: true, message: 'Exam archived', exam: updated });
+  }
+
+  // ── POST /exams/:id/unarchive ──────────────────────────────────────────────
+  if (subPath === '/unarchive' && method === 'POST') {
+    const nowIso = now();
+    await env.DB.prepare(
+      'UPDATE exams SET archived = 0, archived_at = NULL, updated_at = ? WHERE id = ?',
+    )
+      .bind(nowIso, examId)
+      .run();
+
+    await writeAuditLog(env.DB, {
+      actor_user_id: user.id,
+      action: 'unarchive_exam',
+      target: examId,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+      meta: { title: rawExam.title },
+    });
+
+    const updated = await getExamWithQuestions(env.DB, examId);
+    return jsonOk({ ok: true, message: 'Exam unarchived', exam: updated });
+  }
+
+  // ── GET /exams/:id/results.csv ─────────────────────────────────────────────
+  if (subPath === '/results.csv' && method === 'GET') {
+    const ptsRow = await env.DB.prepare(
+      'SELECT COALESCE(SUM(points), 0) AS total_points FROM questions WHERE exam_id = ?',
+    )
+      .bind(examId)
+      .first<{ total_points: number }>();
+    const maxScore = Number(ptsRow?.total_points) || 0;
+
+    const attempts = await env.DB.prepare(
+      `SELECT a.id, a.user_id, a.student_name, a.status, a.score, a.grading_status,
+              a.violation_count, u.email, u.student_id AS user_student_id
+       FROM attempts a
+       LEFT JOIN users u ON a.user_id = u.id
+       WHERE a.exam_id = ? AND a.is_test = 0
+       ORDER BY a.started_at ASC`,
+    )
+      .bind(examId)
+      .all<Record<string, unknown>>();
+
+    const header = [
+      'Student Name',
+      'Student ID',
+      'Email',
+      'Status',
+      'Score',
+      'Max Score',
+      'Percentage',
+      'Grading Status',
+      'Violation Count',
+    ];
+
+    const lines: string[] = [header.join(',')];
+
+    for (const a of attempts.results) {
+      const studentName = (a.student_name as string) || '';
+      const studentId = (a.user_student_id as string) || '';
+      const email = (a.email as string) || '';
+      const status = (a.status as string) || '';
+      const score = a.score !== null && a.score !== undefined ? Number(a.score) : '';
+      const scoreStr = score !== '' ? String(score) : '';
+      const pctStr =
+        score !== '' && maxScore > 0
+          ? `${(Math.round(((score as number) / maxScore) * 1000) / 10).toFixed(1)}%`
+          : '';
+      const gradingStatus = (a.grading_status as string) || 'not_graded';
+      const violations = Number(a.violation_count) || 0;
+
+      lines.push(
+        [
+          escapeCsv(studentName),
+          escapeCsv(studentId),
+          escapeCsv(email),
+          escapeCsv(status),
+          escapeCsv(scoreStr),
+          escapeCsv(maxScore),
+          escapeCsv(pctStr),
+          escapeCsv(gradingStatus),
+          escapeCsv(violations),
+        ].join(','),
+      );
+    }
+
+    await writeAuditLog(env.DB, {
+      actor_user_id: user.id,
+      action: 'export_results_csv',
+      target: examId,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+      meta: { title: rawExam.title, attempt_count: attempts.results.length },
+    });
+
+    const csvContent = lines.join('\r\n');
+    const safeTitle = String(rawExam.title || 'results').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+    return new Response(csvContent, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${safeTitle}_results.csv"`,
+      },
+    });
+  }
+
   // ── POST /exams/:id/regenerate-code ────────────────────────────────────────
   if (subPath === '/regenerate-code' && method === 'POST') {
     let newCode = generateJoinCode();
@@ -921,7 +1237,7 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
     let body: { active?: number | boolean } = {};
     try {
       body = (await request.json()) as { active?: number | boolean };
-    } catch {}
+    } catch { }
 
     let nextActive: number;
     if (body.active !== undefined) {

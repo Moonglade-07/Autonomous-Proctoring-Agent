@@ -14,9 +14,10 @@
  *   • Continues into /exam?exam=:examId&name=:name (identity capture, proctoring, questions)
  */
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { PrivacyConsentModal } from '../components/PrivacyConsentModal';
 import type { StudentExamSummary } from '../types';
 
 interface SystemCheck {
@@ -69,17 +70,23 @@ export function StudentLobbyPage() {
   // Countdown timer state
   const [secondsUntilStart, setSecondsUntilStart] = useState<number | null>(null);
   const [windowClosed, setWindowClosed] = useState(false);
+  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
 
   // Load Exam Metadata
-  useEffect(() => {
+  const loadExam = useCallback(() => {
     if (!examId) return;
     setLoading(true);
+    setLoadError('');
     fetch(`/api/student/exams/${examId}`)
       .then(async (r) => {
         const ct = r.headers.get('content-type');
         if (!r.ok) {
           if (ct && ct.includes('application/json')) {
-            const err = (await r.json()) as { error?: string };
+            const err = (await r.json()) as { error?: string; code?: string };
+            if (r.status === 403 && err.code === 'privacy_required') {
+              setShowPrivacyModal(true);
+              return null;
+            }
             throw new Error(err.error || `HTTP ${r.status}`);
           }
           throw new Error(`HTTP ${r.status}`);
@@ -87,6 +94,7 @@ export function StudentLobbyPage() {
         return r.json() as Promise<{ exam: StudentExamSummary }>;
       })
       .then((data) => {
+        if (!data) return;
         setExam(data.exam);
         // Check window
         const now = Date.now();
@@ -111,6 +119,10 @@ export function StudentLobbyPage() {
       .catch((e: Error) => setLoadError(e.message))
       .finally(() => setLoading(false));
   }, [examId]);
+
+  useEffect(() => {
+    loadExam();
+  }, [loadExam]);
 
   // Window Countdown Interval
   useEffect(() => {
@@ -233,6 +245,10 @@ export function StudentLobbyPage() {
 
   function handleBegin() {
     if (!canBegin || !exam) return;
+    if (user?.role === 'student' && !user?.privacy_accepted) {
+      setShowPrivacyModal(true);
+      return;
+    }
     // Stop local lobby stream so ExamPage can acquire its own stream
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -462,6 +478,20 @@ export function StudentLobbyPage() {
           </button>
         </div>
       </main>
+
+      <PrivacyConsentModal
+        isOpen={showPrivacyModal}
+        onConsentSuccess={async () => {
+          setShowPrivacyModal(false);
+          loadExam();
+          if (canBegin && exam) {
+            handleBegin();
+          }
+        }}
+        onCancel={() => {
+          setShowPrivacyModal(false);
+        }}
+      />
     </div>
   );
 }

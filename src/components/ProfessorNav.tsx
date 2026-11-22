@@ -20,8 +20,6 @@ export function ProfessorNav({ onKeyChange }: { onKeyChange?: () => void }) {
     }
   }
 
-  const isExamsActive = location.pathname.startsWith('/professor/exams') || location.pathname === '/professor';
-
   return (
     <nav style={navStyle}>
       <div style={brand}>
@@ -30,15 +28,37 @@ export function ProfessorNav({ onKeyChange }: { onKeyChange?: () => void }) {
       </div>
       <div style={links}>
         <Link
+          to="/professor"
+          style={{
+            ...linkStyle,
+            background: location.pathname === '/professor' ? 'rgba(99,102,241,0.2)' : 'transparent',
+            color: location.pathname === '/professor' ? '#818cf8' : '#94a3b8',
+            borderBottom: location.pathname === '/professor' ? '2px solid #818cf8' : '2px solid transparent',
+          }}
+        >
+          📊 Dashboard
+        </Link>
+        <Link
           to="/professor/exams"
           style={{
             ...linkStyle,
-            background: isExamsActive ? 'rgba(99,102,241,0.2)' : 'transparent',
-            color: isExamsActive ? '#818cf8' : '#94a3b8',
-            borderBottom: isExamsActive ? '2px solid #818cf8' : '2px solid transparent',
+            background: location.pathname.startsWith('/professor/exams') ? 'rgba(99,102,241,0.2)' : 'transparent',
+            color: location.pathname.startsWith('/professor/exams') ? '#818cf8' : '#94a3b8',
+            borderBottom: location.pathname.startsWith('/professor/exams') ? '2px solid #818cf8' : '2px solid transparent',
           }}
         >
           📋 Exams
+        </Link>
+        <Link
+          to="/professor/profile"
+          style={{
+            ...linkStyle,
+            background: location.pathname === '/professor/profile' ? 'rgba(99,102,241,0.2)' : 'transparent',
+            color: location.pathname === '/professor/profile' ? '#818cf8' : '#94a3b8',
+            borderBottom: location.pathname === '/professor/profile' ? '2px solid #818cf8' : '2px solid transparent',
+          }}
+        >
+          👤 Profile
         </Link>
       </div>
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 14 }}>

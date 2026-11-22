@@ -11,7 +11,7 @@ import { useAuth } from '../context/AuthContext';
 export function ForbiddenPage() {
   const { user, logout } = useAuth();
 
-  const destination = user?.role === 'student' ? '/student' : '/professor/exams';
+  const destination = user?.role === 'student' ? '/student' : '/professor';
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center text-slate-100">

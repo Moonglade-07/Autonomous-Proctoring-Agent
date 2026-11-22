@@ -134,6 +134,8 @@ export async function handleAuthApi(request: Request, env: AuthEnv): Promise<Res
       role: 'student',
       student_id: studentId,
       department: null,
+      privacy_accepted: false,
+      privacy_accepted_at: null,
     };
 
     const cookieHeader = serializeAuthCookie(token, isSecure);
@@ -163,7 +165,7 @@ export async function handleAuthApi(request: Request, env: AuthEnv): Promise<Res
       .prepare(
         `SELECT COUNT(*) as fail_count
          FROM login_attempts
-         WHERE ip = ? AND success = 0 AND attempted_at > ?`,
+         WHERE ip = ? AND success = 0 AND attempted_at > ? AND email NOT LIKE 'pwd:%'`,
       )
       .bind(ip, fifteenMinAgo)
       .first<{ fail_count: number }>();
@@ -187,7 +189,7 @@ export async function handleAuthApi(request: Request, env: AuthEnv): Promise<Res
       .prepare(
         `SELECT COUNT(*) as fail_count
          FROM login_attempts
-         WHERE email = ? AND success = 0 AND attempted_at > ?`,
+         WHERE email = ? AND success = 0 AND attempted_at > ? AND email NOT LIKE 'pwd:%'`,
       )
       .bind(email, fifteenMinAgo)
       .first<{ fail_count: number }>();
@@ -302,6 +304,8 @@ export async function handleAuthApi(request: Request, env: AuthEnv): Promise<Res
       role: user.role,
       student_id: user.student_id,
       department: user.department,
+      privacy_accepted: !!user.privacy_accepted_at,
+      privacy_accepted_at: user.privacy_accepted_at ?? null,
     };
 
     const cookieHeader = serializeAuthCookie(token, isSecure);
@@ -333,6 +337,11 @@ export async function handleAuthApi(request: Request, env: AuthEnv): Promise<Res
     }
 
     const { user } = auth;
+    const userRow = await env.DB
+      .prepare('SELECT privacy_accepted_at FROM users WHERE id = ?')
+      .bind(user.id)
+      .first<{ privacy_accepted_at: string | null }>();
+
     const safeUser: SafeUser = {
       id: user.id,
       email: user.email,
@@ -340,9 +349,128 @@ export async function handleAuthApi(request: Request, env: AuthEnv): Promise<Res
       role: user.role,
       student_id: user.student_id,
       department: user.department,
+      privacy_accepted: !!userRow?.privacy_accepted_at,
+      privacy_accepted_at: userRow?.privacy_accepted_at ?? null,
     };
 
     return json({ user: safeUser });
+  }
+
+  // ── 5. POST /api/auth/change-password ─────────────────────────────────────
+  if (path === '/api/auth/change-password' && method === 'POST') {
+    const auth = await requireAuth(request, env);
+    if (isAuthResponse(auth)) {
+      return auth;
+    }
+    const user = auth.user;
+
+    // Rate limit: 5 wrong currentPassword attempts in 15 minutes per user returns 429
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const failStats = await env.DB
+      .prepare(
+        `SELECT COUNT(*) as fail_count
+         FROM login_attempts
+         WHERE email = ? AND success = 0 AND attempted_at > ?`,
+      )
+      .bind(`pwd:${user.id}`, fifteenMinAgo)
+      .first<{ fail_count: number }>();
+
+    if ((failStats?.fail_count ?? 0) >= 5) {
+      await writeAudit(env, {
+        actor_user_id: user.id,
+        action: 'change_password_rate_limit',
+        target: user.id,
+        ip,
+        meta: { reason: 'too_many_password_change_failures' },
+      });
+      return err(
+        'too_many_requests',
+        'Too many failed attempts. Please try again later.',
+        429,
+      );
+    }
+
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return err('invalid_request', 'Invalid current password or new password does not meet requirements', 400);
+    }
+
+    const { currentPassword, newPassword } = (body as Record<string, unknown>) || {};
+
+    const userRow = await env.DB
+      .prepare('SELECT * FROM users WHERE id = ?')
+      .bind(user.id)
+      .first<User>();
+
+    if (!userRow) {
+      return err('unauthorized', 'User not found', 401);
+    }
+
+    // Verify current password with constant-time PBKDF2 check
+    const currentMatches =
+      typeof currentPassword === 'string' &&
+      (await verifyPassword(currentPassword, userRow.password_hash, userRow.password_salt));
+
+    if (!currentMatches) {
+      const attemptId = `la-${crypto.randomUUID()}`;
+      await env.DB
+        .prepare('INSERT INTO login_attempts (id, email, ip, attempted_at, success) VALUES (?, ?, ?, ?, 0)')
+        .bind(attemptId, `pwd:${user.id}`, '-', new Date().toISOString())
+        .run();
+
+      await writeAudit(env, {
+        actor_user_id: user.id,
+        action: 'change_password_failure',
+        target: user.id,
+        ip,
+        meta: { reason: 'wrong_current_password' },
+      });
+
+      return err('invalid_request', 'Invalid current password or new password does not meet requirements', 400);
+    }
+
+    // Validate newPassword: 10 to 128 characters
+    if (typeof newPassword !== 'string' || newPassword.length < 10 || newPassword.length > 128) {
+      return err('invalid_request', 'Invalid current password or new password does not meet requirements', 400);
+    }
+
+    // Fresh salt and hash with PBKDF2
+    const { hashHex, saltHex } = await hashPassword(newPassword);
+    const newTokenVersion = (userRow.token_version ?? 0) + 1;
+    const nowIso = new Date().toISOString();
+
+    await env.DB
+      .prepare(
+        `UPDATE users
+         SET password_hash = ?, password_salt = ?, token_version = ?, password_changed_at = ?
+         WHERE id = ?`,
+      )
+      .bind(hashHex, saltHex, newTokenVersion, nowIso, user.id)
+      .run();
+
+    // Re-issue auth cookie for current session with new token_version
+    const newToken = await signJwt(
+      { sub: user.id, role: user.role, tv: newTokenVersion },
+      env.JWT_SECRET,
+    );
+    const cookieHeader = serializeAuthCookie(newToken!, isSecure);
+
+    // Record success in rate limit table
+    await env.DB
+      .prepare('INSERT INTO login_attempts (id, email, ip, attempted_at, success) VALUES (?, ?, ?, ?, 1)')
+      .bind(`la-${crypto.randomUUID()}`, `pwchange:${user.id}`, ip, nowIso)
+      .run();
+
+    await writeAudit(env, {
+      actor_user_id: user.id,
+      action: 'change_password',
+      target: user.id,
+      ip,
+    });
+
+    return json({ ok: true, message: 'Password changed successfully' }, 200, { 'Set-Cookie': cookieHeader });
   }
 
   return err('not_found', 'Not found', 404);

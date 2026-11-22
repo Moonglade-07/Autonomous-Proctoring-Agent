@@ -77,6 +77,15 @@ export const WORKER_ROUTER_TABLE: RegisteredRoute[] = [
     scope: 'global',
     description: 'Get authenticated user profile and roles',
   },
+  {
+    id: 'auth_change_password',
+    method: 'POST',
+    path: '/api/auth/change-password',
+    role: 'authenticated',
+    scope: 'global',
+    description: 'Change user password with multi-device session revocation',
+    sampleBody: { currentPassword: 'Password123!', newPassword: 'NewPassword123!' },
+  },
 
   // ── Admin API ───────────────────────────────────────────────────────────────
   {
@@ -125,6 +134,31 @@ export const WORKER_ROUTER_TABLE: RegisteredRoute[] = [
     scope: 'global',
     description: 'Join/enroll in an exam using join code',
     sampleBody: { code: 'ABC-123' },
+  },
+  {
+    id: 'student_accept_privacy',
+    method: 'POST',
+    path: '/api/student/accept-privacy',
+    role: 'student',
+    scope: 'global',
+    description: 'Record student consent to privacy policy',
+  },
+  {
+    id: 'student_home',
+    method: 'GET',
+    path: '/api/student/home',
+    role: 'student',
+    scope: 'global',
+    description: 'Get student consolidated dashboard with in-progress, upcoming, and past exams',
+  },
+  {
+    id: 'student_profile',
+    method: 'PUT',
+    path: '/api/student/profile',
+    role: 'student',
+    scope: 'global',
+    description: 'Update student profile name and student id',
+    sampleBody: { name: 'Updated Name', student_id: 'S99999' },
   },
   {
     id: 'student_my_exams',
@@ -200,6 +234,14 @@ export const WORKER_ROUTER_TABLE: RegisteredRoute[] = [
   },
 
   // ── Professor / Admin: Exam Management ─────────────────────────────────────
+  {
+    id: 'prof_home',
+    method: 'GET',
+    path: '/api/professor/home',
+    role: 'professor_or_admin',
+    scope: 'global',
+    description: 'Get professor dashboard metrics, attention list, and exams',
+  },
   {
     id: 'prof_list_exams',
     method: 'GET',
@@ -279,6 +321,33 @@ export const WORKER_ROUTER_TABLE: RegisteredRoute[] = [
     role: 'professor_or_admin',
     scope: 'exam',
     description: 'Reset exam back to draft (enforces Phase 4c-2b violation rules)',
+    testParams: { examId: 'exam-1' },
+  },
+  {
+    id: 'prof_archive_exam',
+    method: 'POST',
+    path: '/api/professor/exams/:id/archive',
+    role: 'professor_or_admin',
+    scope: 'exam',
+    description: 'Archive an exam and disable its join code',
+    testParams: { examId: 'exam-1' },
+  },
+  {
+    id: 'prof_unarchive_exam',
+    method: 'POST',
+    path: '/api/professor/exams/:id/unarchive',
+    role: 'professor_or_admin',
+    scope: 'exam',
+    description: 'Restore an archived exam',
+    testParams: { examId: 'exam-1' },
+  },
+  {
+    id: 'prof_export_results_csv',
+    method: 'GET',
+    path: '/api/professor/exams/:id/results.csv',
+    role: 'professor_or_admin',
+    scope: 'exam',
+    description: 'Export exam submission results to CSV with formula injection defense',
     testParams: { examId: 'exam-1' },
   },
   {

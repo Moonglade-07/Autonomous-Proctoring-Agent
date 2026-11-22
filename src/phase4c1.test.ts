@@ -49,6 +49,8 @@ const mockStudentUser: User = {
   token_version: 0,
   created_at: new Date().toISOString(),
   last_login_at: null,
+  privacy_accepted_at: '2026-01-01T00:00:00Z',
+  password_changed_at: null,
 };
 
 const handleStudentApi = async (req: Request, env: any) => {

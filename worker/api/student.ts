@@ -25,6 +25,7 @@ import {
 } from '../utils/questionGrading.js';
 import type { StudentQuestion, DerivedExamStatus, ResultStatus } from '../types.js';
 import { requireAuth, isAuthResponse } from '../auth/requireAuth.js';
+import { writeAudit } from '../utils/audit.js';
 
 export { gradeAttempt, toStudentQuestion };
 
@@ -184,6 +185,24 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
       return err('Too many failed join attempts. Please try again later.', 429);
     }
 
+    // Privacy consent check (Phase 5c)
+    const userRow = await env.DB.prepare('SELECT privacy_accepted_at FROM users WHERE id = ?')
+      .bind(user.id)
+      .first<{ privacy_accepted_at: string | null }>();
+
+    if (user.role === 'student' && !userRow?.privacy_accepted_at) {
+      return new Response(
+        JSON.stringify({
+          code: 'privacy_required',
+          error: {
+            code: 'privacy_required',
+            message: 'You must review and accept the proctoring privacy notice before participating in exams.',
+          },
+        }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+
     // Look up exam by normalized join code
     const exam = await env.DB.prepare(
       'SELECT * FROM exams WHERE join_code = ?',
@@ -224,9 +243,8 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
       const enrollId = `en-${crypto.randomUUID()}`;
       try {
         await env.DB.prepare(
-          `INSERT INTO exam_enrollments (id, exam_id, user_id, joined_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(exam_id, user_id) WHERE user_id IS NOT NULL DO NOTHING`,
+          `INSERT OR IGNORE INTO exam_enrollments (id, exam_id, user_id, joined_at)
+           VALUES (?, ?, ?, ?)`,
         )
           .bind(enrollId, exam.id, user.id, attemptTime)
           .run();
@@ -252,6 +270,175 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
       start_time: exam.start_time,
       end_time: exam.end_time,
       status: exam.status,
+    });
+  }
+
+  // ── POST /accept-privacy (Phase 5c) ─────────────────────────────────────────
+  if (path === '/accept-privacy' && method === 'POST') {
+    const nowIso = new Date().toISOString();
+    await env.DB.prepare('UPDATE users SET privacy_accepted_at = ? WHERE id = ?')
+      .bind(nowIso, user.id)
+      .run();
+
+    await writeAudit(env, {
+      actor_user_id: user.id,
+      action: 'accept_privacy',
+      target: user.id,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+    });
+
+    return json({ ok: true, privacy_accepted: true, privacy_accepted_at: nowIso });
+  }
+
+  // ── GET /home (Phase 5c) ───────────────────────────────────────────────────
+  if (path === '/home' && method === 'GET') {
+    const nowMs = Date.now();
+
+    // 1. In Progress attempts owned by this student
+    const inProgressRows = await env.DB.prepare(
+      `SELECT e.id, a.id as attempt_id, a.exam_id, a.started_at, a.deadline_at, a.paused_at,
+              e.title, e.course_code, e.duration_minutes, e.start_time, e.end_time
+       FROM attempts a
+       JOIN exams e ON a.exam_id = e.id
+       WHERE a.user_id = ? AND a.status = 'in_progress' AND (a.is_test = 0 OR a.is_test IS NULL)
+       ORDER BY a.started_at DESC`,
+    )
+      .bind(user.id)
+      .all<Record<string, unknown>>();
+
+    // 2. Upcoming & Joined exams: enrolled exams where student hasn't submitted yet
+    const enrolledRows = await env.DB.prepare(
+      `SELECT en.joined_at, e.id as exam_id, e.title, e.course_code, e.duration_minutes,
+              e.start_time, e.end_time, e.status, e.archived,
+              a.id as attempt_id, a.status as attempt_status
+       FROM exam_enrollments en
+       JOIN exams e ON en.exam_id = e.id
+       LEFT JOIN attempts a ON a.exam_id = e.id AND a.user_id = en.user_id AND (a.is_test = 0 OR a.is_test IS NULL)
+       WHERE en.user_id = ? AND (e.archived = 0 OR e.archived IS NULL)
+       ORDER BY e.start_time ASC, en.joined_at DESC`,
+    )
+      .bind(user.id)
+      .all<Record<string, unknown>>();
+
+    const upcomingList = enrolledRows.results
+      .filter((r) => !r.attempt_status || r.attempt_status === 'in_progress')
+      .map((r) => {
+        const startMs = r.start_time ? new Date(r.start_time as string).getTime() : 0;
+        const endMs = r.end_time ? new Date(r.end_time as string).getTime() : Infinity;
+        const windowOpen = (!r.start_time || nowMs >= startMs) && (!r.end_time || nowMs <= endMs);
+        const secondsUntilStart = r.start_time && startMs > nowMs ? Math.ceil((startMs - nowMs) / 1000) : 0;
+
+        return {
+          id: r.exam_id as string,
+          exam_id: r.exam_id as string,
+          title: r.title as string,
+          course_code: r.course_code as string | null,
+          duration_minutes: r.duration_minutes as number,
+          start_time: r.start_time as string | null,
+          end_time: r.end_time as string | null,
+          joined_at: r.joined_at as string,
+          status: r.status as string,
+          has_attempt: !!r.attempt_id,
+          attempt_id: (r.attempt_id as string) || null,
+          window_open: windowOpen,
+          seconds_until_start: secondsUntilStart,
+        };
+      });
+
+    // 3. Past exams: submitted, auto_submitted, or terminated attempts
+    const pastRows = await env.DB.prepare(
+      `SELECT a.id as attempt_id, a.exam_id, a.status as attempt_status, a.score, a.max_score,
+              a.submitted_at, a.grading_status, a.fully_graded,
+              e.title, e.course_code, e.duration_minutes, e.results_released, e.instant_results
+       FROM attempts a
+       JOIN exams e ON a.exam_id = e.id
+       WHERE a.user_id = ? AND a.status IN ('submitted', 'auto_submitted', 'terminated') AND (a.is_test = 0 OR a.is_test IS NULL)
+       ORDER BY a.submitted_at DESC`,
+    )
+      .bind(user.id)
+      .all<Record<string, unknown>>();
+
+    const pastList = pastRows.results.map((r) => {
+      const resultsReleased = r.results_released === 1;
+      const instantResults = r.instant_results === 1;
+      const fullyGraded = r.fully_graded === 1;
+      const isAutoOnly = r.grading_status === 'auto_graded';
+
+      let resultStatus: 'result_available' | 'being_graded' | 'submitted_pending_release' = 'submitted_pending_release';
+      if ((resultsReleased && fullyGraded) || (instantResults && isAutoOnly && fullyGraded)) {
+        resultStatus = 'result_available';
+      } else if (resultsReleased && !fullyGraded) {
+        resultStatus = 'being_graded';
+      }
+
+      const scoreNum = r.score != null ? Number(r.score) : null;
+      const maxNum = r.max_score != null ? Number(r.max_score) : null;
+      const percentage = scoreNum != null && maxNum && maxNum > 0 ? Math.round((scoreNum / maxNum) * 100) : null;
+
+      return {
+        id: r.exam_id as string,
+        attempt_id: r.attempt_id as string,
+        exam_id: r.exam_id as string,
+        title: r.title as string,
+        course_code: r.course_code as string | null,
+        duration_minutes: r.duration_minutes as number,
+        submitted_at: r.submitted_at as string | null,
+        status: r.attempt_status as string,
+        score: scoreNum,
+        max_score: maxNum,
+        percentage,
+        result_status: resultStatus,
+      };
+    });
+
+    return json({
+      in_progress: inProgressRows.results,
+      upcoming: upcomingList,
+      past: pastList,
+    });
+  }
+
+  // ── PUT /profile (Phase 5c) ────────────────────────────────────────────────
+  if (path === '/profile' && method === 'PUT') {
+    let body: any;
+    try {
+      body = await request.json();
+    } catch {
+      return err('Invalid JSON body', 400);
+    }
+
+    const name = typeof body.name === 'string' ? body.name.trim() : user.name;
+    const studentId = typeof body.student_id === 'string' ? body.student_id.trim() : (body.student_id === null ? null : user.student_id);
+
+    if (!name || name.length > 100) {
+      return err('Name must be between 1 and 100 characters', 400);
+    }
+    if (studentId && studentId.length > 50) {
+      return err('Student ID cannot exceed 50 characters', 400);
+    }
+
+    await env.DB
+      .prepare('UPDATE users SET name = ?, student_id = ? WHERE id = ?')
+      .bind(name, studentId, user.id)
+      .run();
+
+    await writeAudit(env, {
+      actor_user_id: user.id,
+      action: 'update_profile',
+      target: user.id,
+      ip: request.headers.get('cf-connecting-ip') || '127.0.0.1',
+    });
+
+    return json({
+      ok: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        name,
+        role: user.role,
+        student_id: studentId,
+        department: user.department,
+      },
     });
   }
 
@@ -399,6 +586,26 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
   const startMatch = path.match(/^\/exams\/([^/]+)\/start$/);
   if (method === 'POST' && startMatch) {
     const examId = startMatch[1];
+
+    // Privacy consent check (Phase 5c, exempt for preview attempts by professors/admins)
+    if (user.role === 'student') {
+      const userRow = await env.DB.prepare('SELECT privacy_accepted_at FROM users WHERE id = ?')
+        .bind(user.id)
+        .first<{ privacy_accepted_at: string | null }>();
+
+      if (!userRow?.privacy_accepted_at) {
+        return new Response(
+          JSON.stringify({
+            code: 'privacy_required',
+            error: {
+              code: 'privacy_required',
+              message: 'You must review and accept the proctoring privacy notice before participating in exams.',
+            },
+          }),
+          { status: 403, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+    }
 
     // Enrollment check: student must have joined the exam
     const enrollment = await env.DB.prepare(
@@ -787,13 +994,13 @@ export async function doSubmit(
           ? (raw.options as string[])
           : typeof raw.options === 'string'
             ? (() => {
-                try {
-                  const parsed = JSON.parse(raw.options as string);
-                  return Array.isArray(parsed) ? parsed : null;
-                } catch {
-                  return null;
-                }
-              })()
+              try {
+                const parsed = JSON.parse(raw.options as string);
+                return Array.isArray(parsed) ? parsed : null;
+              } catch {
+                return null;
+              }
+            })()
             : null,
       };
     });

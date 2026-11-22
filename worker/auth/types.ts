@@ -17,6 +17,8 @@ export interface User {
   token_version: number;
   created_at: string;
   last_login_at: string | null;
+  privacy_accepted_at?: string | null;
+  password_changed_at?: string | null;
 }
 
 export interface SafeUser {
@@ -26,6 +28,8 @@ export interface SafeUser {
   role: UserRole;
   student_id: string | null;
   department: string | null;
+  privacy_accepted?: boolean;
+  privacy_accepted_at?: string | null;
 }
 
 export interface JwtPayload {
