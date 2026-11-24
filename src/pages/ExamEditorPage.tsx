@@ -610,10 +610,29 @@ function SubmissionsTab({
                         fontWeight: 600,
                         padding: '4px 10px',
                         cursor: 'pointer',
+                        marginRight: 6,
                       }}
                     >
                       📝 Grade
                     </button>
+                    <a
+                      href={`/professor/attempts/${a.id}/report`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        background: 'rgba(168, 85, 247, 0.15)',
+                        border: '1px solid rgba(168, 85, 247, 0.3)',
+                        borderRadius: 6,
+                        color: '#d8b4fe',
+                        fontSize: 12,
+                        fontWeight: 600,
+                        padding: '4px 10px',
+                        textDecoration: 'none',
+                        display: 'inline-block',
+                      }}
+                    >
+                      🛡️ Report
+                    </a>
                   </td>
                 </tr>
               ))}
@@ -747,9 +766,183 @@ function SubmissionsTab({
   );
 }
 
+// ─── Exam Review Tab (Phase 6) ───────────────────────────────────────────────
+
+function ExamReviewTab({ examId }: { examId: string }) {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<'all' | 'unreviewed' | 'reviewed'>('all');
+  const [levelFilter, setLevelFilter] = useState<string>('all');
+
+  const fetchQueue = () => {
+    setLoading(true);
+    setError(null);
+
+    const params = new URLSearchParams();
+    if (statusFilter !== 'all') params.set('status', statusFilter);
+    if (levelFilter !== 'all') params.set('level', levelFilter);
+
+    fetch(`/api/professor/exams/${encodeURIComponent(examId)}/review?${params.toString()}`)
+      .then(async (res) => {
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || 'Failed to load review queue');
+        }
+        return res.json() as Promise<{ items: any[] }>;
+      })
+      .then((data) => {
+        setItems(data.items || []);
+        setLoading(false);
+      })
+      .catch((e: any) => {
+        setError(e.message);
+        setLoading(false);
+      });
+  };
+
+  useEffect(() => {
+    fetchQueue();
+  }, [examId, statusFilter, levelFilter]);
+
+  const getLevelBadge = (level: string) => {
+    switch (level) {
+      case 'high':
+        return { bg: 'rgba(244, 63, 94, 0.2)', color: '#fda4af', border: '1px solid rgba(244, 63, 94, 0.4)', label: 'High' };
+      case 'medium':
+        return { bg: 'rgba(245, 158, 11, 0.2)', color: '#fcd34d', border: '1px solid rgba(245, 158, 11, 0.4)', label: 'Medium' };
+      case 'low':
+        return { bg: 'rgba(59, 130, 246, 0.2)', color: '#93c5fd', border: '1px solid rgba(59, 130, 246, 0.4)', label: 'Low' };
+      case 'none':
+        return { bg: 'rgba(16, 185, 129, 0.2)', color: '#6ee7b7', border: '1px solid rgba(16, 185, 129, 0.4)', label: 'None' };
+      default:
+        return { bg: 'rgba(100, 116, 139, 0.2)', color: '#cbd5e1', border: '1px solid rgba(100, 116, 139, 0.4)', label: 'Not recorded' };
+    }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 16, color: '#f1f5f9' }}>Flagged Exam Attempts</h2>
+          <p style={{ margin: '4px 0 0', fontSize: 12, color: '#64748b' }}>
+            Attempts flagged for academic integrity evaluation. Sorted by urgency level and risk.
+          </p>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as any)}
+            style={{ background: '#090d16', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, padding: '6px 10px', color: '#f8fafc', fontSize: 12 }}
+          >
+            <option value="all">All Statuses</option>
+            <option value="unreviewed">Unreviewed Only</option>
+            <option value="reviewed">Reviewed Only</option>
+          </select>
+
+          <select
+            value={levelFilter}
+            onChange={(e) => setLevelFilter(e.target.value)}
+            style={{ background: '#090d16', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, padding: '6px 10px', color: '#f8fafc', fontSize: 12 }}
+          >
+            <option value="all">All Priorities</option>
+            <option value="high">High Priority</option>
+            <option value="medium">Medium Priority</option>
+            <option value="low">Low Priority</option>
+            <option value="none">None (Clean)</option>
+            <option value="unknown">Not Recorded (Legacy)</option>
+          </select>
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ color: '#64748b', fontSize: 13, padding: '32px 0', textAlign: 'center' }}>Loading review queue…</div>
+      ) : error ? (
+        <div style={{ color: '#f43f5e', fontSize: 13, padding: '24px 0', textAlign: 'center' }}>⚠️ {error}</div>
+      ) : items.length === 0 ? (
+        <div style={{ color: '#64748b', fontSize: 13, padding: '40px 0', textAlign: 'center', background: '#0f172a', borderRadius: 12, border: '1px solid rgba(255,255,255,0.06)' }}>
+          No attempts in this exam currently match the selected filters.
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto', background: '#0f172a', borderRadius: 12, border: '1px solid rgba(255,255,255,0.08)' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.08)', background: 'rgba(255,255,255,0.02)' }}>
+                {['Student', 'Review Priority', 'Risk Score', 'Violations', 'Decision', 'Time Ended', 'Action'].map((h) => (
+                  <th key={h} style={{ padding: '12px 16px', textAlign: 'left', color: '#64748b', fontWeight: 600, fontSize: 11, textTransform: 'uppercase' }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((it) => {
+                const badge = getLevelBadge(it.reviewLevel);
+                return (
+                  <tr key={it.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                    <td style={{ padding: '12px 16px', color: '#e2e8f0', fontWeight: 600 }}>
+                      <div>{it.studentName}</div>
+                      <div style={{ fontSize: 11, color: '#64748b', fontWeight: 400 }}>{it.studentEmail || it.id}</div>
+                    </td>
+                    <td style={{ padding: '12px 16px' }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 6, background: badge.bg, color: badge.color, border: badge.border }}>
+                        {badge.label}
+                      </span>
+                    </td>
+                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontWeight: 700, color: '#f1f5f9' }}>
+                      {it.finalRiskScore !== null ? `${it.finalRiskScore}` : '—'}
+                    </td>
+                    <td style={{ padding: '12px 16px', color: '#94a3b8' }}>
+                      {it.violationCount !== null ? `${it.violationCount}` : 'Not recorded'}
+                      {it.maxSeverity && <span style={{ fontSize: 10, marginLeft: 4, textTransform: 'uppercase', color: '#64748b' }}>({it.maxSeverity})</span>}
+                    </td>
+                    <td style={{ padding: '12px 16px' }}>
+                      {it.reviewDecision ? (
+                        <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', padding: '2px 6px', borderRadius: 4, background: 'rgba(16,185,129,0.2)', color: '#34d399', border: '1px solid rgba(16,185,129,0.3)' }}>
+                          ✓ {it.reviewDecision.replace('_', ' ')}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 11, color: '#64748b', fontStyle: 'italic' }}>Pending</span>
+                      )}
+                    </td>
+                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', color: '#64748b', fontSize: 11 }}>
+                      {it.endedAt ? new Date(it.endedAt).toLocaleDateString() : '—'}
+                    </td>
+                    <td style={{ padding: '12px 16px' }}>
+                      <a
+                        href={`/professor/attempts/${it.id}/report`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{
+                          background: 'rgba(168, 85, 247, 0.15)',
+                          border: '1px solid rgba(168, 85, 247, 0.3)',
+                          borderRadius: 6,
+                          color: '#d8b4fe',
+                          fontSize: 12,
+                          fontWeight: 600,
+                          padding: '4px 10px',
+                          textDecoration: 'none',
+                          display: 'inline-block',
+                        }}
+                      >
+                        Open Report →
+                      </a>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main ExamEditorPage ──────────────────────────────────────────────────────
 
-type EditorTab = 'overview' | 'questions' | 'live' | 'submissions' | 'settings';
+type EditorTab = 'overview' | 'questions' | 'live' | 'submissions' | 'review' | 'settings';
 
 export function ExamEditorPage() {
   const { id } = useParams<{ id: string }>();
@@ -1190,6 +1383,12 @@ export function ExamEditorPage() {
           📥 Submissions
         </button>
         <button
+          style={{ ...tabBtn, borderBottom: activeTab === 'review' ? '2px solid #818cf8' : '2px solid transparent', color: activeTab === 'review' ? '#f1f5f9' : '#64748b' }}
+          onClick={() => handleTabChange('review')}
+        >
+          🛡️ Review
+        </button>
+        <button
           style={{ ...tabBtn, borderBottom: activeTab === 'settings' ? '2px solid #818cf8' : '2px solid transparent', color: activeTab === 'settings' ? '#f1f5f9' : '#64748b' }}
           onClick={() => handleTabChange('settings')}
         >
@@ -1499,7 +1698,14 @@ export function ExamEditorPage() {
         </div>
       )}
 
-      {/* ── Tab 5: SETTINGS ───────────────────────────────────────────────── */}
+      {/* ── Tab 5: INTEGRITY REVIEW (Phase 6) ──────────────────────────────── */}
+      {activeTab === 'review' && (
+        <div>
+          <ExamReviewTab examId={exam.id} />
+        </div>
+      )}
+
+      {/* ── Tab 6: SETTINGS ───────────────────────────────────────────────── */}
       {activeTab === 'settings' && (
         <form onSubmit={handleSaveSettings} style={{ maxWidth: 680, display: 'flex', flexDirection: 'column', gap: 20 }}>
           {/* Metadata */}

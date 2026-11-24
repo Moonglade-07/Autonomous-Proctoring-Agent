@@ -258,14 +258,22 @@ export function ProfessorHomePage() {
             <p className="text-[11px] text-slate-500 mt-1">Ungraded non-test attempts</p>
           </div>
 
-          <div className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800/80 shadow-lg">
+          <Link
+            to="/professor/review"
+            className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800/80 shadow-lg hover:border-indigo-500/50 transition group block"
+          >
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">Flagged Exams</span>
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 group-hover:text-indigo-300 transition">
+                Flagged Attempts
+              </span>
               <span className={data.summary.flagged_exams > 0 ? 'text-rose-400' : 'text-slate-500'}>🚨</span>
             </div>
             <p className="text-3xl font-black text-white mt-2">{data.summary.flagged_exams}</p>
-            <p className="text-[11px] text-slate-500 mt-1">Exams with integrity violations</p>
-          </div>
+            <p className="text-[11px] text-slate-500 mt-1 flex items-center justify-between">
+              <span>Attempts flagged for review</span>
+              <span className="text-indigo-400 font-bold group-hover:translate-x-0.5 transition">→</span>
+            </p>
+          </Link>
         </div>
 
         {/* ── Needs Attention Section ──────────────────────────────────────── */}

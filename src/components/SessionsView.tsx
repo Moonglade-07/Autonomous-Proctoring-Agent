@@ -532,6 +532,15 @@ export function SessionsView({
                     <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
                       {view === 'ended' && (
                         <>
+                          <a
+                            href={`/professor/attempts/${att.id}/report`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 rounded bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition inline-block"
+                            title="Open integrity report"
+                          >
+                            Report
+                          </a>
                           <button
                             onClick={() => void handleArchive([att.id])}
                             disabled={busy}
@@ -584,6 +593,15 @@ export function SessionsView({
 
                       {view === 'archived' && (
                         <>
+                          <a
+                            href={`/professor/attempts/${att.id}/report`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 rounded bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition inline-block"
+                            title="Open integrity report"
+                          >
+                            Report
+                          </a>
                           <button
                             onClick={() => void handleUnarchive([att.id])}
                             disabled={busy}

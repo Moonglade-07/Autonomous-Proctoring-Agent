@@ -592,6 +592,54 @@ export const WORKER_ROUTER_TABLE: RegisteredRoute[] = [
     sampleBody: { mode: 'full' },
   },
 
+  // ── Integrity Reports & Review Queue (Phase 6) ─────────────────────────────
+  {
+    id: 'prof_attempt_report',
+    method: 'GET',
+    path: '/api/professor/attempts/:attemptId/report',
+    role: 'professor_or_admin',
+    scope: 'attempt',
+    description: 'Get formal integrity report and evidence summary for an attempt',
+    testParams: { attemptId: 'att-a' },
+  },
+  {
+    id: 'prof_attempt_review',
+    method: 'PUT',
+    path: '/api/professor/attempts/:attemptId/review',
+    role: 'professor_or_admin',
+    scope: 'attempt',
+    description: 'Record or clear human review decision and notes on ended attempt',
+    testParams: { attemptId: 'att-a' },
+    sampleBody: { decision: 'no_action', note: 'All clear' },
+  },
+  {
+    id: 'prof_violation_review',
+    method: 'PUT',
+    path: '/api/professor/attempts/:attemptId/violations/:violationId/review',
+    role: 'professor_or_admin',
+    scope: 'attempt',
+    description: 'Confirm or dismiss an individual violation on an attempt',
+    testParams: { attemptId: 'att-a' },
+    sampleBody: { decision: 'confirmed' },
+  },
+  {
+    id: 'prof_exam_review_queue',
+    method: 'GET',
+    path: '/api/professor/exams/:id/review',
+    role: 'professor_or_admin',
+    scope: 'exam',
+    description: 'Review queue for a specific exam with filtering and sorting',
+    testParams: { examId: 'exam-a' },
+  },
+  {
+    id: 'prof_review_queue_global',
+    method: 'GET',
+    path: '/api/professor/review',
+    role: 'professor_or_admin',
+    scope: 'global',
+    description: 'Cross-exam review queue for all accessible exams',
+  },
+
   // ── WebSockets ──────────────────────────────────────────────────────────────
   {
     id: 'ws_student_proctoring',

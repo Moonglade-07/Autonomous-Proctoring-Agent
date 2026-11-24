@@ -31,6 +31,7 @@ import { canAccessExam } from '../utils/auth.js';
 export { canAccessExam } from '../utils/auth.js';
 import { handleGradingApi } from './grading.js';
 import { handleSessionsApi } from './sessions.js';
+import { handleReportsApi } from './reports.js';
 import { requireAuth, isAuthResponse } from '../auth/requireAuth.js';
 import { writeAuditLog } from '../utils/audit.js';
 import { escapeCsv } from '../utils/csv.js';
@@ -326,6 +327,10 @@ export async function handleProfessorApi(request: Request, env: DbEnv): Promise<
   // ── Delegate to grading API ────────────────────────────────────────────────
   const gradingRes = await handleGradingApi(request, env as any, path, method, user);
   if (gradingRes !== null) return gradingRes;
+
+  // ── Delegate to reports & review API (Phase 6) ───────────────────────────
+  const reportsRes = await handleReportsApi(request, env as any, path, method, user);
+  if (reportsRes !== null) return reportsRes;
 
   // ── Delegate to sessions API (Phase 4c-2b & 5a) ────────────────────────────
   const sessionsMatch = path.match(/^\/exams\/([^/]+)\/(sessions.*|preview-start)$/);

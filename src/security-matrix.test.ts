@@ -302,6 +302,7 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
       'api/grading.ts',
       'api/sessions.ts',
       'api/student.ts',
+      'api/reports.ts',
     ];
 
     const detectedRoutes: { method: string; path: string; file: string }[] = [];
@@ -385,6 +386,21 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
         if (line.includes("subPath === '/results.csv'") && line.includes('GET')) {
           detectedRoutes.push({ method: 'GET', path: '/api/professor/exams/:id/results.csv', file: relFile });
         }
+        if (line.includes("reportMatch = path.match") && line.includes('GET')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/professor/attempts/:attemptId/report', file: relFile });
+        }
+        if (line.includes("attemptReviewMatch = path.match") && line.includes('PUT')) {
+          detectedRoutes.push({ method: 'PUT', path: '/api/professor/attempts/:attemptId/review', file: relFile });
+        }
+        if (line.includes("violationReviewMatch = path.match") && line.includes('PUT')) {
+          detectedRoutes.push({ method: 'PUT', path: '/api/professor/attempts/:attemptId/violations/:violationId/review', file: relFile });
+        }
+        if (line.includes("examReviewMatch = path.match") && line.includes('GET')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/professor/exams/:id/review', file: relFile });
+        }
+        if (line.includes("path === '/review'") && line.includes('GET')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/professor/review', file: relFile });
+        }
       }
     }
 
@@ -399,8 +415,8 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
       ).toBeDefined();
     }
 
-    // Total registered routes count must match 62
-    expect(WORKER_ROUTER_TABLE.length).toBe(62);
+    // Total registered routes count must match 67
+    expect(WORKER_ROUTER_TABLE.length).toBe(67);
   });
 });
 
@@ -412,6 +428,7 @@ describe('Phase 5a Security Review: Exhaustive Route Security Matrix', () => {
     url = url.replace(':sessionId', params?.sessionId || 'sess-a');
     url = url.replace(':qid', params?.questionId || 'q-a1');
     url = url.replace(':examId', params?.examId || 'exam-a');
+    url = url.replace(':violationId', 'viol-1');
     return url;
   }
 

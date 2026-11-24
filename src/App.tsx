@@ -46,6 +46,8 @@ import { StudentHelpPage } from './pages/StudentHelpPage';
 import { StudentPrivacyPage } from './pages/StudentPrivacyPage';
 import { StudentLobbyPage } from './pages/StudentLobbyPage';
 import { StudentResultPage } from './pages/StudentResultPage';
+import { ProfessorReviewQueuePage } from './pages/ProfessorReviewQueuePage';
+import { ProfessorReportPage } from './pages/ProfessorReportPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 /** Wraps any professor-area page with the sticky top nav. */
@@ -200,6 +202,22 @@ export default function App() {
                 <ProfessorLayout>
                   <ExamEditorPage />
                 </ProfessorLayout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/professor/review"
+            element={
+              <ProtectedRoute allowedRoles={['professor', 'admin']}>
+                <ProfessorReviewQueuePage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/professor/attempts/:attemptId/report"
+            element={
+              <ProtectedRoute allowedRoles={['professor', 'admin']}>
+                <ProfessorReportPage />
               </ProtectedRoute>
             }
           />

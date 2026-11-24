@@ -218,4 +218,49 @@ describe('Simulated /api/student/attempts/:id/result (show_answers=0)', () => {
     };
     expect(containsAnswerLeak(result)).toBe(false);
   });
+
+  it('strictly excludes Phase 6 integrity reports, violations, risk scores, and review decisions', () => {
+    const prohibitedKeys = [
+      'review_decision',
+      'reviewDecision',
+      'review_note',
+      'reviewNote',
+      'reviewed_at',
+      'reviewedAt',
+      'reviewed_by',
+      'reviewedBy',
+      'final_risk_score',
+      'finalRiskScore',
+      'riskScore',
+      'violation_count',
+      'violationCount',
+      'max_severity',
+      'maxSeverity',
+      'violations',
+      'riskTimeline',
+      'reviewLevel',
+      'report',
+    ];
+
+    const studentResult = {
+      attempt: {
+        id: 'at-abc123',
+        exam_id: 'exam-1',
+        student_name: 'Alice',
+        status: 'submitted',
+        score: 7,
+        max_score: 11,
+        grading_status: 'auto_graded',
+      },
+      answers: [
+        { question_id: 'q-001', answer_json: '"Merge"' },
+      ],
+    };
+
+    const serialized = JSON.stringify(studentResult);
+    for (const key of prohibitedKeys) {
+      expect(serialized).not.toContain(`"${key}"`);
+      expect(key in (studentResult.attempt as any)).toBe(false);
+    }
+  });
 });

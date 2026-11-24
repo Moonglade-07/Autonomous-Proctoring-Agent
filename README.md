@@ -617,6 +617,84 @@ Phase 5c introduces dedicated, role-specific portals, streamlined navigation wit
 - Password reset via email and email verification are intentionally not implemented (requires email delivery integration).
 - Proctoring time extensions, broadcast messaging, and pre-uploaded student rosters are scheduled for future milestones.
 
+## Phase 6: Integrity Reports, Review Queue, Human Decisions & Print/PDF Views
+
+Phase 6 provides professors and academic integrity administrators with formal, auditable review tooling. After or during an exam, professors can open an in-depth integrity report for any attempt, inspect timeline risk score progression, review AI-flagged violations, confirm or dismiss individual events, record a binding human decision with notes, and print or export a clean PDF record.
+
+### 1. D1 Migration (`0008_reports.sql`)
+- **`attempts` table**:
+  - `review_decision TEXT CHECK (review_decision IS NULL OR review_decision IN ('no_action', 'warning', 'escalate'))`: Recorded decision by human reviewer.
+  - `review_note TEXT`: Contextual notes and justification (up to 2,000 characters).
+  - `reviewed_at TEXT`: ISO-8601 UTC timestamp of the review decision.
+  - `reviewed_by TEXT`: User ID of the reviewer.
+  - Index: `CREATE INDEX IF NOT EXISTS idx_attempts_review_decision ON attempts(review_decision)`.
+- **`violation_reviews` table**:
+  - `attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE`.
+  - `violation_id TEXT NOT NULL`.
+  - `decision TEXT NOT NULL CHECK (decision IN ('confirmed', 'dismissed'))`.
+  - `reviewed_by TEXT NOT NULL`, `reviewed_at TEXT NOT NULL`.
+  - Composite primary key on `(attempt_id, violation_id)` enabling idempotent upserts.
+  - Index: `idx_violation_reviews_attempt`.
+
+### 2. Review Level Pure Function & Reasoning Rules
+Review levels are determined objectively by `computeReviewLevel(...)` and explained via `getReviewReasons(...)` in `worker/utils/reviewLevel.ts`:
+- **`unknown`**: When `violationCount` is `NULL` or `undefined` (legacy attempt or incomplete write). Labeled as *"Not recorded"*.
+- **`high`**:
+  - `finalRiskScore >= maxRiskScore` (boundary at exam threshold, e.g. 80).
+  - `maxSeverity === 'critical'`.
+  - Identity mismatch (`identity_mismatch`) or multiple faces (`multiple_faces`) detected during the attempt.
+- **`medium`**:
+  - `maxSeverity === 'high'`.
+  - `violationCount >= 3`.
+- **`low`**:
+  - `violationCount >= 1` (minor violations with low/medium severity).
+- **`none`**:
+  - Clean attempt with 0 violations and risk score below threshold.
+
+> **Academic Integrity Standard**: The review level is strictly a prompt for human review, never an automated verdict. The system never uses defamatory terms such as "cheating" or "guilty". All automated signals are treated as evidence to be reviewed by authorized instructors.
+
+### 3. Report & Review Queue API Endpoints
+- **`GET /api/professor/attempts/:attemptId/report`**:
+  - Access restricted to exam owner (`canAccessExam`) or administrators. Non-owners receive `404 Not Found`. Test attempts (`is_test = 1`) are restricted solely to their creator.
+  - Retrieves proctoring history from `ExamSessionDO` via internal authenticated channel (`X-Internal-Auth`).
+  - Merges human review decisions from `violation_reviews`.
+  - Appends an audit log record with `action: 'view_report'`.
+  - **Information Protection**: Strictly omits student answers, correct answer rubrics, passwords, and tokens.
+- **`PUT /api/professor/attempts/:attemptId/review`**:
+  - Restricts review decision submissions to **ended attempts only**; returns `409 Conflict` if the attempt is still in progress.
+  - Validates payload with Zod (`decision: 'no_action' | 'warning' | 'escalate' | null`, `note`: max 2,000 characters).
+  - Allows clearing a decision with `decision: null`.
+  - Appends an audit log record with `action: 'review_attempt'`.
+- **`PUT /api/professor/attempts/:attemptId/violations/:violationId/review`**:
+  - Requires the `violationId` to exist in the attempt's proctoring history (returns `404` if not found).
+  - Upserts into `violation_reviews` with `decision: 'confirmed' | 'dismissed' | null`.
+  - Dismissing or confirming an item does not rewrite DO telemetry or scores; it only annotates the report. Struck-through styling indicates dismissed events in the UI without hiding them.
+  - Appends an audit log record with `action: 'review_violation'`.
+- **`GET /api/professor/exams/:id/review`**:
+  - Fetches review queue for an exam filtered by `level` and `status` (`unreviewed`, `reviewed`, `all`).
+  - Computed purely from D1 columns (no DO calls) and sorted by urgency level rank, then final risk score descending.
+  - Excludes test attempts (`is_test = 0`) and archived attempts (`archived = 0`) by default.
+- **`GET /api/professor/review`**:
+  - Cross-exam review queue for all accessible exams with exam metadata columns.
+
+### 4. Report UI & Print/PDF View (`/professor/attempts/:attemptId/report`)
+- **Header**: Exam details, student identification, duration, final risk score badge, and review level chip with expandable "Why flagged" explanation.
+- **Risk Timeline SVG Chart**: Inline vector line chart showing risk score evolution over time with red triangle markers for violations, blue diamond markers for interventions, and a dashed line at the exam's risk threshold.
+- **Accessible Table Fallback**: One-click toggle displaying raw timeline timestamps, scores, and triggers in an accessible HTML table.
+- **Flagged Violations Table**: Lists time, type, severity, duration, AI confidence, plain-text explanations, and immediate Confirm/Dismiss toggle buttons.
+- **Intervention History**: Complete log of warnings, pauses, resumes, and force-submits with student acknowledgment timestamps.
+- **Decision Panel**: Clean interface to select No Action, Warning, or Escalate with justification notes.
+- **Retention Interaction**: If detailed evidence was purged under the retention policy (`data_purged_at` is set), displays a prominent banner (*"Detailed evidence was removed by the retention policy. Only the summary below is available."*) while preserving the D1 score and violation count summary.
+- **Print / Save as PDF**:
+  - Pure client-side `window.print()` trigger styled via `@media print`.
+  - Automatically hides navigation, toolbars, and buttons; renders black text on clean white backgrounds; avoids page breaks inside table rows.
+  - Includes authoritative decision-aid footer:
+    > *"This report is a decision aid. Flags are generated automatically and require human review."*
+
+### 5. Known Scope Boundaries (Local-Only Phase 6)
+- Local work only: No remote migrations or deployments performed in Phase 6.
+- The Admin Panel (Phase 7), audio monitoring, screenshot storage, ID photo matching, and student-facing integrity reports remain out of scope. Students never receive integrity reports, risk scores, or violation records.
+
 
 
 

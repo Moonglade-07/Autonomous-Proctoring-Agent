@@ -84,6 +84,24 @@ async function getAttempt(db: D1Database, id: string) {
     .first<Record<string, unknown>>();
 }
 
+export function sanitizeStudentAttempt(raw: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  if (!raw) return null;
+  const {
+    review_decision,
+    review_note,
+    reviewed_at,
+    reviewed_by,
+    final_risk_score,
+    violation_count,
+    max_severity,
+    last_violation_at,
+    evidence_hold,
+    data_purged_at,
+    ...safeAttempt
+  } = raw;
+  return safeAttempt;
+}
+
 function computeSecondsRemaining(attempt: Record<string, unknown>): number {
   const deadline = new Date(attempt.deadline_at as string).getTime();
   const now = Date.now();
@@ -656,7 +674,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
           .all<{ question_id: string; answer_json: string; marked_for_review: number }>();
 
         return json({
-          attempt: refreshed,
+          attempt: sanitizeStudentAttempt(refreshed),
           questions,
           answers: savedAnswers.results,
           seconds_remaining: 0,
@@ -673,7 +691,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
         .all<{ question_id: string; answer_json: string; marked_for_review: number }>();
 
       return json({
-        attempt: existing,
+        attempt: sanitizeStudentAttempt(existing),
         questions,
         answers: savedAnswers.results,
         seconds_remaining: secondsRemaining,
@@ -704,7 +722,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     const attempt = await getAttempt(env.DB, attemptId);
     const initialSeconds = Math.max(0, Math.floor((deadlineMs - nowMs) / 1000));
     return json({
-      attempt: attempt!,
+      attempt: sanitizeStudentAttempt(attempt)!,
       questions,
       answers: [],
       seconds_remaining: initialSeconds,
@@ -827,7 +845,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
     if (!attempt || attempt.user_id !== user.id) return err('Attempt not found', 404);
 
     if (attempt.status !== 'in_progress') {
-      return json({ attempt, submitted: true, idempotent: true });
+      return json({ attempt: sanitizeStudentAttempt(attempt), submitted: true, idempotent: true });
     }
 
     await doSubmit(env.DB, attempt, 'submitted');
@@ -850,7 +868,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
       }
     }
     const updated = await getAttempt(env.DB, attemptId);
-    return json({ attempt: updated, submitted: true });
+    return json({ attempt: sanitizeStudentAttempt(updated), submitted: true });
   }
 
   // ── GET /attempts/:id/result ───────────────────────────────────────────────
@@ -953,7 +971,7 @@ export async function handleStudentApi(request: Request, env: StudentEnv): Promi
 
     return json({
       status: 'result_available',
-      attempt,
+      attempt: sanitizeStudentAttempt(attempt),
       score: attempt.score,
       max_score: attempt.max_score,
       percentage,

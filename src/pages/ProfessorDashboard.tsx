@@ -627,6 +627,18 @@ function DetailDrawer({ session, onClose, onSendCommand, lastResult }: DetailDra
           </div>
         </div>
 
+        {/* Phase 6: Open Full Integrity Report */}
+        {((session as any).attemptId || (session as any).id) && (
+          <a
+            href={`/professor/attempts/${(session as any).attemptId || (session as any).id}/report`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="w-full py-2.5 px-4 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-200 border border-indigo-500/30 text-xs font-bold text-center block transition shadow"
+          >
+            🛡️ Open Full Integrity Report →
+          </a>
+        )}
+
         {/* Phase 3b: Intervention Panel */}
         <div>
           <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">
