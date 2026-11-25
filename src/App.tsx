@@ -48,6 +48,12 @@ import { StudentLobbyPage } from './pages/StudentLobbyPage';
 import { StudentResultPage } from './pages/StudentResultPage';
 import { ProfessorReviewQueuePage } from './pages/ProfessorReviewQueuePage';
 import { ProfessorReportPage } from './pages/ProfessorReportPage';
+import { AdminLayout } from './components/AdminNav';
+import { AdminOverviewPage } from './pages/AdminOverviewPage';
+import { AdminUsersPage } from './pages/AdminUsersPage';
+import { AdminExamsPage } from './pages/AdminExamsPage';
+import { AdminAuditPage } from './pages/AdminAuditPage';
+import { AdminSecurityPage } from './pages/AdminSecurityPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 /** Wraps any professor-area page with the sticky top nav. */
@@ -218,6 +224,58 @@ export default function App() {
             element={
               <ProtectedRoute allowedRoles={['professor', 'admin']}>
                 <ProfessorReportPage />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* ── Admin Management Portal (Protected: Admin only) ──────────────── */}
+          <Route
+            path="/admin"
+            element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminLayout>
+                  <AdminOverviewPage />
+                </AdminLayout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/admin/users"
+            element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminLayout>
+                  <AdminUsersPage />
+                </AdminLayout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/admin/exams"
+            element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminLayout>
+                  <AdminExamsPage />
+                </AdminLayout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/admin/audit"
+            element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminLayout>
+                  <AdminAuditPage />
+                </AdminLayout>
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/admin/security"
+            element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <AdminLayout>
+                  <AdminSecurityPage />
+                </AdminLayout>
               </ProtectedRoute>
             }
           />

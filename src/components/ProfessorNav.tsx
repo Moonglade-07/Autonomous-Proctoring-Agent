@@ -60,6 +60,19 @@ export function ProfessorNav({ onKeyChange }: { onKeyChange?: () => void }) {
         >
           👤 Profile
         </Link>
+        {user?.role === 'admin' && (
+          <Link
+            to="/admin"
+            style={{
+              ...linkStyle,
+              background: 'rgba(239,68,68,0.15)',
+              color: '#f87171',
+              border: '1px solid rgba(239,68,68,0.3)',
+            }}
+          >
+            🛡️ Admin Panel
+          </Link>
+        )}
       </div>
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 14 }}>
         {user && (

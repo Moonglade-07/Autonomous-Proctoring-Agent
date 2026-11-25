@@ -691,9 +691,87 @@ Review levels are determined objectively by `computeReviewLevel(...)` and explai
   - Includes authoritative decision-aid footer:
     > *"This report is a decision aid. Flags are generated automatically and require human review."*
 
-### 5. Known Scope Boundaries (Local-Only Phase 6)
-- Local work only: No remote migrations or deployments performed in Phase 6.
-- The Admin Panel (Phase 7), audio monitoring, screenshot storage, ID photo matching, and student-facing integrity reports remain out of scope. Students never receive integrity reports, risk scores, or violation records.
+### 5. Known Scope Boundaries (Phase 6)
+- The Admin Panel (Phase 7), audio monitoring, screenshot storage, ID photo matching, and student-facing integrity reports were handled separately or remain out of scope. Students never receive integrity reports, risk scores, or violation records.
+
+---
+
+## Phase 7: Admin Panel, Governance, Audit Logging & Cron Health
+
+Phase 7 delivers a centralized administration and governance suite for the Autonomous Proctoring Agent platform. Administrators can manage user accounts, oversee all exams across professors, inspect append-only audit trails, analyze authentication security metrics and account lockouts, and monitor background cron sweeps without manual database queries.
+
+### 1. D1 Migration (`0009_admin.sql`)
+- **`cron_runs` table**:
+  - `job TEXT PRIMARY KEY`: Identifier for scheduled sweep (`auto_end_sweep`, `retention_sweep`).
+  - `last_run_at TEXT`: ISO-8601 UTC timestamp of the most recent execution.
+  - `last_ok INTEGER`: Boolean flag (1 = success, 0 = failed).
+  - `last_count INTEGER`: Number of records processed or purged.
+  - `last_error TEXT`: Error message if run failed, or `NULL`.
+- **Performance Indexes**:
+  - `idx_users_role_active ON users(role, active)`: Accelerates user filtering and active administrator counts.
+  - `idx_audit_log_action_ts ON audit_log(action, ts)`: Fast lookup and filtering by audit action and time.
+  - `idx_audit_log_actor_ts ON audit_log(actor_user_id, ts)`: Fast lookup by acting user and timestamp.
+- **Append-Only Audit Log Triggers**:
+  - `audit_log_no_update`: `BEFORE UPDATE ON audit_log` raises `ABORT('audit_log is append-only')`.
+  - `audit_log_no_delete`: `BEFORE DELETE ON audit_log` raises `ABORT('audit_log is append-only')`.
+  - Protects audit trail integrity directly at the SQLite storage layer; entries can only be inserted, never modified or erased.
+- **Timestamps**:
+  - All timestamps are ISO-8601 UTC strings generated in the Cloudflare Worker application code (e.g. `new Date().toISOString()`), avoiding local timezone drift or SQLite `datetime()` discrepancies.
+
+### 2. Admin API Endpoints (`/api/admin/*`)
+All admin endpoints strictly require `requireAuth(['admin'])`. Unauthenticated requests return `401 Unauthorized`; authenticated requests by professors or students return `403 Forbidden`.
+
+| Method | Path | Description & Guarantees |
+|---|---|---|
+| `GET` | `/api/admin/overview` | Platform-wide metrics: user counts by role/status, exams by status and archived state, attempts started in last 24h & 7d, current in-progress count, submissions waiting for manual grading, unreviewed flagged attempts, and `cron_runs` entries with `age_seconds`. D1 only, excludes test attempts (`is_test = 0`). |
+| `GET` | `/api/admin/users` | Keyset-paginated directory of users (max 50/page). Supports search by email or name with SQL wildcard escaping (`%`, `_`, `\`), and filtering by role (`student`, `professor`, `admin`) and status (`active`, `inactive`). Never returns `password_hash`, `password_salt`, or `token_version`. |
+| `POST` | `/api/admin/users` | Creates staff accounts (`professor` or `admin` only). Hashes password with PBKDF2-SHA256 (100,000 iterations, 16-byte random salt). Appends `create_user` audit entry. |
+| `POST` | `/api/admin/users/:id/deactivate` | Deactivates a user (`active = 0`) and increments `token_version` by 1 to immediately revoke all existing JWTs. Refuses self-deactivation with `409` (`cannot_deactivate_self`). Refuses deactivating the last active administrator with `409` (`last_admin`). Returns `404` for unknown user. Appends `deactivate_user` audit entry. |
+| `POST` | `/api/admin/users/:id/reactivate` | Reactivates a user (`active = 1`) and increments `token_version` by 1. Returns `404` for unknown user. Appends `reactivate_user` audit entry. |
+| `GET` | `/api/admin/exams` | Global exam list with owner name/email, join code status, archived status, and counts of enrolled, submitted, and in-progress attempts (excluding test attempts). Supports search, status filtering, and keyset pagination. |
+| `POST` | `/api/admin/exams/:id/reassign` | Reassigns `exams.created_by` to an active professor or administrator. Refuses with `409` (`exam_in_progress`) if student attempts are currently in progress. Submissions, answers, and integrity reviews remain untouched. Appends `reassign_exam` audit entry recording old and new owner. |
+| `GET` | `/api/admin/audit` | Keyset-paginated audit entries (max 100/page). Filterable by `action`, `actor`, `target`, `from`, and `to`. Resolves actor name and email. Returns `meta_json` as a raw string without server interpretation. Viewing the audit log is not self-logged to avoid log inflation. |
+| `GET` | `/api/admin/security/failed-logins` | Failed login metrics grouped by target email and client IP over a window of 1 to 168 hours. Excludes change-password attempts (`email LIKE 'pwd:%'`). Lists currently locked accounts (>= 5 failures in the last 15 minutes). |
+
+### 3. Admin UI & Navigation
+- **Navigation & Role Guarding**:
+  - Upon login, users with the `admin` role land directly on `/admin`.
+  - The navigation header displays the **Admin Navigation Bar** (`AdminNav`) with links to **Overview**, **Users**, **Exams**, **Audit**, and **Security**, plus a quick link to the Professor Portal (`/professor`).
+  - Professors and students accessing `/admin/*` receive the platform's standard `403 Forbidden` page with no administrative UI or links exposed.
+- **Admin Pages**:
+  - **Overview (`/admin`)**: Summary metric cards (Users, Exams, In-Progress Attempts, Attention Items) and the **Background Cron Sweeps** status board. Shows health status, execution age, and processed counts for `auto_end_sweep` and `retention_sweep`. Emits a red warning alert if the auto-end sweep is older than 5 minutes or the retention sweep is older than 26 hours.
+  - **User Directory (`/admin/users`)**: Search bar, role filter dropdown, active/inactive status filter, and keyset pagination. Includes a **"Create staff account"** modal with role selection (`professor` or `admin`), 10+ character password strength indicator, and an explicit advisory reminding the admin to share credentials securely. Includes **Deactivate** and **Reactivate** confirmation dialogs with buttons automatically disabled if the action would violate self-deactivation or last-admin rules.
+  - **Exam Management (`/admin/exams`)**: Searchable, paginated directory of all platform exams. Features a **"Reassign Owner"** modal allowing selection of any active professor or administrator, with the submit button disabled and an explanatory warning if the exam has live student attempts.
+  - **Audit Log Viewer (`/admin/audit`)**: Action filter, actor filter, target filter, and date range filters with keyset pagination. Rows expand to display formatted, plain-text `meta_json` details.
+  - **Security & Failed Logins (`/admin/security`)**: Time window selector (1h, 6h, 24h, 7d). Displays locked accounts requiring attention, top targeted email addresses, and top offending IP addresses.
+- **Plain-Text XSS Defense**:
+  - All dynamic data across the Admin UI (user names, emails, exam titles, IDs, error messages, and audit metadata) is rendered strictly as plain text (no `dangerouslySetInnerHTML`), ensuring that injection strings like `<script>` or `=cmd` are displayed safely as raw text.
+
+### 4. Governance & Self-Protection Rules
+1. **Self-Deactivation Protection**: An administrator cannot deactivate their own account (`cannot_deactivate_self`).
+2. **Last Administrator Protection**: An administrator cannot deactivate the last active administrator on the platform (`last_admin`), preventing administrative lockout.
+3. **Live Exam Reassignment Protection**: Exams cannot be reassigned while student attempts are actively in progress (`exam_in_progress`), preventing race conditions and split ownership during active testing.
+4. **Token Revocation Guarantee**: Deactivating or reactivating a user increments their `token_version` in D1, immediately invalidating any active JWT cookies and forcing re-authentication.
+5. **Append-Only Immutability**: SQLite triggers reject any `UPDATE` or `DELETE` against the `audit_log` table. Entries are permanent records of administrative and security events. Passwords, secrets, and authorization tokens are strictly excluded from audit entries.
+
+### 5. Creating the Initial Administrator Account
+Because the platform does not allow self-registration for administrative accounts, the initial administrator must be provisioned via the secure CLI bootstrapping script:
+
+```bash
+# Create initial admin account locally:
+node scripts/create-user.mjs --role admin --email admin@example.com --name "System Administrator"
+
+# Create initial admin account remotely (production):
+node scripts/create-user.mjs --role admin --email admin@example.com --name "System Administrator" --remote
+```
+
+The script will securely prompt for a password with input masking:
+- Enforces 10 to 128 character password length.
+- Requires confirmation to prevent typos.
+- Generates a cryptographically random 16-byte salt (`crypto.randomBytes(16)`).
+- Derives a PBKDF2-SHA256 hash using 100,000 iterations.
+- Inserts the user record into Cloudflare D1 with `role = 'admin'`, `active = 1`, and `token_version = 0`.
+
 
 
 

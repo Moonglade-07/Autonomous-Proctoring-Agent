@@ -338,16 +338,34 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
         if (line.includes("path === '/me'") && line.includes('GET')) {
           detectedRoutes.push({ method: 'GET', path: '/api/auth/me', file: relFile });
         }
-        if (line.includes("path === '/users'") && line.includes('GET')) {
+        if ((line.includes("path === '/users'") || line.includes("path === '/api/admin/users'")) && line.includes('GET')) {
           detectedRoutes.push({ method: 'GET', path: '/api/admin/users', file: relFile });
         }
-        if (line.includes("path === '/users'") && line.includes('POST')) {
+        if ((line.includes("path === '/users'") || line.includes("path === '/api/admin/users'")) && line.includes('POST')) {
           detectedRoutes.push({ method: 'POST', path: '/api/admin/users', file: relFile });
         }
         if (line.includes('/deactivate') && line.includes('POST')) {
           detectedRoutes.push({ method: 'POST', path: '/api/admin/users/:id/deactivate', file: relFile });
         }
-        if (line.includes("path === '/claim-legacy-exams'") && line.includes('POST')) {
+        if (line.includes('/reactivate') && line.includes('POST')) {
+          detectedRoutes.push({ method: 'POST', path: '/api/admin/users/:id/reactivate', file: relFile });
+        }
+        if (line.includes('/exams') && line.includes('GET') && relFile === 'api/admin.ts') {
+          detectedRoutes.push({ method: 'GET', path: '/api/admin/exams', file: relFile });
+        }
+        if (line.includes('/reassign') && line.includes('POST')) {
+          detectedRoutes.push({ method: 'POST', path: '/api/admin/exams/:id/reassign', file: relFile });
+        }
+        if (line.includes('/overview') && line.includes('GET')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/admin/overview', file: relFile });
+        }
+        if (line.includes('/audit') && line.includes('GET') && relFile === 'api/admin.ts') {
+          detectedRoutes.push({ method: 'GET', path: '/api/admin/audit', file: relFile });
+        }
+        if (line.includes('/security/failed-logins') && line.includes('GET')) {
+          detectedRoutes.push({ method: 'GET', path: '/api/admin/security/failed-logins', file: relFile });
+        }
+        if (line.includes('claim-legacy-exams') && line.includes('POST')) {
           detectedRoutes.push({ method: 'POST', path: '/api/admin/claim-legacy-exams', file: relFile });
         }
         if (line.includes("path === '/join'") && line.includes('POST')) {
@@ -415,8 +433,8 @@ describe('Phase 5a Security Review: Authoritative Router Table Verification', ()
       ).toBeDefined();
     }
 
-    // Total registered routes count must match 67
-    expect(WORKER_ROUTER_TABLE.length).toBe(67);
+    // Total registered routes count must match 73
+    expect(WORKER_ROUTER_TABLE.length).toBe(73);
   });
 });
 

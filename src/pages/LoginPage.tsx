@@ -27,6 +27,8 @@ export function LoginPage() {
         navigate(from, { replace: true });
       } else if (user.role === 'student') {
         navigate('/student', { replace: true });
+      } else if (user.role === 'admin') {
+        navigate('/admin', { replace: true });
       } else {
         navigate('/professor', { replace: true });
       }

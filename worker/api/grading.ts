@@ -661,75 +661,104 @@ ${studentAnswerText}
  * Triggered by the cron schedule every minute.
  */
 export async function runAutoEndSweep(env: GradingEnv): Promise<{ processed: number }> {
-  const { doSubmit } = await import('./student.js');
-
-  // Find up to 50 overdue, unpaused attempts (compare ISO string to ISO string)
-  const unpausedCutoff = new Date(Date.now() - 30000).toISOString();
-  const overdueUnpaused = await env.DB.prepare(
-    `SELECT * FROM attempts
-     WHERE status = 'in_progress'
-       AND paused_at IS NULL
-       AND deadline_at < ?
-     LIMIT 50`,
-  )
-    .bind(unpausedCutoff)
-    .all<Record<string, unknown>>();
-
-  // Also find abandoned paused attempts past exam end_time + 24 hours
-  const pausedCutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const overduePaused = await env.DB.prepare(
-    `SELECT a.* FROM attempts a
-     JOIN exams e ON a.exam_id = e.id
-     WHERE a.status = 'in_progress'
-       AND a.paused_at IS NOT NULL
-       AND e.end_time IS NOT NULL
-       AND e.end_time < ?
-     LIMIT 50`,
-  )
-    .bind(pausedCutoff)
-    .all<Record<string, unknown>>();
-
-  const rawList = [...overdueUnpaused.results, ...overduePaused.results];
-  const toSubmit = Array.from(new Map(rawList.map((a) => [a.id as string, a])).values());
+  const nowIso = new Date().toISOString();
+  let isOk = 1;
+  let errorMsg: string | null = null;
   let processed = 0;
 
-  for (const attempt of toSubmit) {
-    try {
-      // Idempotency: verify attempt is still in_progress
-      const fresh = await env.DB.prepare('SELECT status FROM attempts WHERE id = ?')
-        .bind(attempt.id)
-        .first<{ status: string }>();
+  try {
+    const { doSubmit } = await import('./student.js');
 
-      if (!fresh || fresh.status !== 'in_progress') {
-        continue;
-      }
+    // Find up to 50 overdue, unpaused attempts (compare ISO string to ISO string)
+    const unpausedCutoff = new Date(Date.now() - 30000).toISOString();
+    const overdueUnpaused = await env.DB.prepare(
+      `SELECT * FROM attempts
+       WHERE status = 'in_progress'
+         AND paused_at IS NULL
+         AND deadline_at < ?
+       LIMIT 50`,
+    )
+      .bind(unpausedCutoff)
+      .all<Record<string, unknown>>();
 
-      await doSubmit(env.DB, attempt, 'auto_submitted');
-      processed++;
+    // Also find abandoned paused attempts past exam end_time + 24 hours
+    const pausedCutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const overduePaused = await env.DB.prepare(
+      `SELECT a.* FROM attempts a
+       JOIN exams e ON a.exam_id = e.id
+       WHERE a.status = 'in_progress'
+         AND a.paused_at IS NOT NULL
+         AND e.end_time IS NOT NULL
+         AND e.end_time < ?
+       LIMIT 50`,
+    )
+      .bind(pausedCutoff)
+      .all<Record<string, unknown>>();
 
-      // Notify connected student WS & trigger final DO sync
-      if (env.EXAM_SESSION && attempt.session_id) {
-        try {
-          const doId = env.EXAM_SESSION.idFromName(attempt.session_id as string);
-          const stub = env.EXAM_SESSION.get(doId);
-          await stub.fetch(
-            new Request(`http://internal/end?sessionId=${encodeURIComponent(attempt.session_id as string)}`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Internal-Auth': env.INTERNAL_SECRET || '',
-              },
-              body: JSON.stringify({
-                endedReason: 'auto_submitted',
-                message: 'Exam time expired. Attempt has been auto-submitted.',
+    const rawList = [...overdueUnpaused.results, ...overduePaused.results];
+    const toSubmit = Array.from(new Map(rawList.map((a) => [a.id as string, a])).values());
+
+    for (const attempt of toSubmit) {
+      try {
+        // Idempotency: verify attempt is still in_progress
+        const fresh = await env.DB.prepare('SELECT status FROM attempts WHERE id = ?')
+          .bind(attempt.id)
+          .first<{ status: string }>();
+
+        if (!fresh || fresh.status !== 'in_progress') {
+          continue;
+        }
+
+        await doSubmit(env.DB, attempt, 'auto_submitted');
+        processed++;
+
+        // Notify connected student WS & trigger final DO sync
+        if (env.EXAM_SESSION && attempt.session_id) {
+          try {
+            const doId = env.EXAM_SESSION.idFromName(attempt.session_id as string);
+            const stub = env.EXAM_SESSION.get(doId);
+            await stub.fetch(
+              new Request(`http://internal/end?sessionId=${encodeURIComponent(attempt.session_id as string)}`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Internal-Auth': env.INTERNAL_SECRET || '',
+                },
+                body: JSON.stringify({
+                  endedReason: 'auto_submitted',
+                  message: 'Exam time expired. Attempt has been auto-submitted.',
+                }),
               }),
-            }),
-          );
-        } catch {}
+            );
+          } catch {}
+        }
+      } catch (e) {
+        console.warn(`[AutoEnd] Failed to auto-submit attempt ${attempt.id}:`, e);
       }
-    } catch (e) {
-      console.warn(`[AutoEnd] Failed to auto-submit attempt ${attempt.id}:`, e);
     }
+  } catch (fatalErr) {
+    isOk = 0;
+    errorMsg = fatalErr instanceof Error ? fatalErr.message : String(fatalErr);
+    console.warn('[AutoEnd] Fatal sweep error:', fatalErr);
+  }
+
+  // Record cron run health (resilient: failure in recording cannot break sweep)
+  try {
+    if (env.DB) {
+      await env.DB.prepare(
+        `INSERT INTO cron_runs (job, last_run_at, last_ok, last_count, last_error)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(job) DO UPDATE SET
+           last_run_at = excluded.last_run_at,
+           last_ok = excluded.last_ok,
+           last_count = excluded.last_count,
+           last_error = excluded.last_error`,
+      )
+        .bind('auto_end_sweep', nowIso, isOk, processed, errorMsg)
+        .run();
+    }
+  } catch (cronErr) {
+    console.warn('[AutoEnd] Failed to record cron_runs entry:', cronErr);
   }
 
   return { processed };

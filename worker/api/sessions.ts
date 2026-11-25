@@ -834,13 +834,16 @@ export async function handleSessionsApi(
 export async function runRetentionSweep(
   env: SessionsEnv,
 ): Promise<{ purgedCount: number; testDeletedCount: number }> {
+  const nowIso = new Date().toISOString();
+  let isOk = 1;
+  let errorMsg: string | null = null;
   let purgedCount = 0;
   let testDeletedCount = 0;
 
   // 1. Purge expired evidence from non-test ended attempts
   try {
     const expiredRows = await env.DB.prepare(
-      `SELECT a.id, a.session_id, a.exam_id, a.ended_at, a.submitted_at, e.end_time, e.retention_days
+      `SELECT a.id, a.session_id, a.exam_id, a.submitted_at, e.end_time, e.retention_days
        FROM attempts a
        JOIN exams e ON a.exam_id = e.id
        WHERE e.retention_days > 0
@@ -855,7 +858,7 @@ export async function runRetentionSweep(
     for (const r of expiredRows.results) {
       try {
         const retentionDays = Number(r.retention_days);
-        const refTimeStr = (r.ended_at || r.submitted_at || r.end_time) as string;
+        const refTimeStr = (r.submitted_at || r.end_time) as string;
         if (!refTimeStr) continue;
         const refTime = new Date(refTimeStr).getTime();
         const expirationTime = refTime + retentionDays * 86400000;
@@ -964,12 +967,36 @@ export async function runRetentionSweep(
   }
 
   // Write one audit_log row for the run
-  await writeAuditLog(env.DB, {
-    actor_user_id: 'system_retention_cron',
-    action: 'retention_sweep',
-    target: 'system',
-    meta: { purgedCount, testDeletedCount },
-  });
+  try {
+    await writeAuditLog(env.DB, {
+      actor_user_id: 'system_retention_cron',
+      action: 'retention_sweep',
+      target: 'system',
+      meta: { purgedCount, testDeletedCount },
+    });
+  } catch (auditErr) {
+    console.warn('[RetentionSweep] Failed to write audit_log row:', auditErr);
+  }
+
+  // Record cron run health (resilient: failure in recording cannot break sweep)
+  try {
+    if (env.DB) {
+      const totalCount = purgedCount + testDeletedCount;
+      await env.DB.prepare(
+        `INSERT INTO cron_runs (job, last_run_at, last_ok, last_count, last_error)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(job) DO UPDATE SET
+           last_run_at = excluded.last_run_at,
+           last_ok = excluded.last_ok,
+           last_count = excluded.last_count,
+           last_error = excluded.last_error`,
+      )
+        .bind('retention_sweep', nowIso, isOk, totalCount, errorMsg)
+        .run();
+    }
+  } catch (cronErr) {
+    console.warn('[RetentionSweep] Failed to record cron_runs entry:', cronErr);
+  }
 
   return { purgedCount, testDeletedCount };
 }

@@ -14,7 +14,13 @@ export function HomePage() {
 
   // Redirect authenticated users to their respective role homes
   if (!loading && user) {
-    return <Navigate to={user.role === 'student' ? '/student' : '/professor'} replace />;
+    if (user.role === 'student') {
+      return <Navigate to="/student" replace />;
+    }
+    if (user.role === 'admin') {
+      return <Navigate to="/admin" replace />;
+    }
+    return <Navigate to="/professor" replace />;
   }
 
   return (
